@@ -104,6 +104,14 @@ class SettingsTab(QWidget):
         self.res_input = QLineEdit(c["desktop_res"])
         self.res_input.setPlaceholderText("1920x1080")
         dform.addRow("Desktop size:", self.res_input)
+
+        self.chk_fullscreen_keys = QCheckBox(
+            "Use F11 for borderless fullscreen (block Ctrl+Enter)")
+        self.chk_fullscreen_keys.setToolTip(
+            "F11 toggles borderless fullscreen on the running Windows program.\n"
+            "Ctrl+Enter is swallowed so the program never receives it.")
+        self.chk_fullscreen_keys.setChecked(c["intercept_fullscreen_keys"])
+        dform.addRow("", self.chk_fullscreen_keys)
         layout.addWidget(disp)
 
         self.chk_debug = QCheckBox("Write extra Wine debug output to logs")
@@ -185,6 +193,7 @@ class SettingsTab(QWidget):
             "virtual_desktop": self.chk_virtual.isChecked(),
             "desktop_res": res,
             "wine_debug": self.chk_debug.isChecked(),
+            "intercept_fullscreen_keys": self.chk_fullscreen_keys.isChecked(),
         })
 
         if not save_config(self.window.config):

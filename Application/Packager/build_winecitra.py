@@ -23,7 +23,7 @@ PACKAGER_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = PACKAGER_DIR.parent
 DEFAULT_CONFIG = PACKAGER_DIR / "Configuration" / "winecitra_config.json"
 
-DEFAULT_DEPENDS = "python3, python3-pyqt6, wine"
+DEFAULT_DEPENDS = "python3, python3-pyqt6, python3-xlib, wine"
 DEFAULT_RECOMMENDS = "winetricks, gamemode, mangohud"
 DEFAULT_INCLUDE = ["main.py", "Core", "UI", "SettingsMemory"]
 

@@ -10,10 +10,13 @@ import hashlib
 import json
 import os
 import re
+import select
 import shlex
 import shutil
 import subprocess
 import sys
+import threading
+import time
 import traceback
 
 from datetime import datetime
@@ -21,12 +24,25 @@ from pathlib import Path
 
 from Core.System.dependancy_check import describe_dependencies
 
+# Optional X11 support for the F11 / Ctrl+Enter interceptor.  The app stays
+# fully usable when python-xlib is not installed; only the key grabbing is
+# disabled in that case.
+try:
+    from Xlib import X as _X
+    from Xlib import XK as _XK
+    from Xlib import display as _xdisplay
+    from Xlib import protocol as _xprotocol
+    _XLIB_AVAILABLE = True
+except Exception:       # pragma: no cover - depends on the host system
+    _X = _XK = _xdisplay = _xprotocol = None
+    _XLIB_AVAILABLE = False
+
 # ============================================================
 # INFO AND PATHS
 # ============================================================
 
 APP_NAME = "WINE Citra"
-APP_VERSION = "0.2.11"
+APP_VERSION = "0.2.21"
 
 HOME = Path.home()
 DATA_DIR = HOME / ".local/share/wine-citra"
@@ -57,6 +73,7 @@ DEFAULT_CONFIG = {
     "virtual_desktop": False,
     "desktop_res": "1920x1080",
     "wine_debug": False,
+    "intercept_fullscreen_keys": True,
     "last_executable": "",
 }
 
@@ -115,7 +132,8 @@ def load_config():
     except (ValueError, TypeError):
         config["fps_limit"] = 0
     for key in ("use_gamemode", "use_mangohud", "enable_esync",
-                "enable_fsync", "dxvk_hud", "virtual_desktop", "wine_debug"):
+                "enable_fsync", "dxvk_hud", "virtual_desktop", "wine_debug",
+                "intercept_fullscreen_keys"):
         config[key] = bool(config[key])
     return config
 
@@ -550,13 +568,24 @@ def launch_from_desktop(executable, arguments):
     """Run a program with no GUI. Used for 'Open with' and the .desktop entry."""
     config = load_config()
     try:
-        start_wine(config, executable, arguments)
+        process, _prefix, _cmd = start_wine(config, executable, arguments)
     except RuntimeError as e:
         log(f"Desktop launch failed: {e}")
         print(f"{APP_NAME}: {e}", file=sys.stderr)
         return 1
     config["last_executable"] = str(Path(executable).expanduser().resolve())
     save_config(config)
+
+    # Keep this small process alive while the game runs, otherwise the
+    # interceptor would exit together with the launcher and F11 would go
+    # back to Wine's built-in fullscreen handling.
+    if config.get("intercept_fullscreen_keys", True) and start_fullscreen_hotkeys(config):
+        try:
+            _wait_for_wine_windows(process)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            stop_fullscreen_hotkeys()
     return 0
 
 
@@ -579,6 +608,420 @@ def install_desktop_entry():
         subprocess.run(["update-desktop-database", str(apps)],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return entry
+
+
+# ============================================================
+# FULLSCREEN HOTKEYS (X11)
+# ============================================================
+#
+# Wine programs normally receive F11 and Ctrl+Enter themselves, so they
+# switch to their own fullscreen mode (which may still have decorations).
+# Citra grabs those two keys on Wine windows instead:
+#
+#   F11         -> toggle EWMH borderless fullscreen on the Wine window
+#   Ctrl+Enter  -> consume the event and do nothing
+#
+# The grabs are installed on the Wine client windows only, never on the
+# root window. That means F11 and Ctrl+Enter keep working normally in every
+# other application, even while a Wine program is running.
+
+def _is_wine_process(pid):
+    """Return True if *pid* looks like a Wine-hosted process."""
+    try:
+        executable = os.readlink(f"/proc/{pid}/exe")
+    except OSError:
+        executable = ""
+
+    if "wine" in os.path.basename(executable).lower():
+        return True
+
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as handle:
+            cmdline = handle.read().replace(b"\0", b" ").decode(
+                "utf-8", errors="replace")
+    except OSError:
+        return False
+
+    lowered = cmdline.lower()
+    return ("wine" in lowered
+            or "c:\\" in lowered or "z:\\" in lowered)
+
+
+class FullscreenKeyInterceptor:
+    """Grab F11 and Ctrl+Enter on Wine windows.
+
+    F11 toggles EWMH fullscreen (borderless fullscreen) on the focused Wine
+    window. Ctrl+Enter is swallowed so the Windows application never sees it.
+    """
+
+    POLL_INTERVAL = 0.5
+
+    def __init__(self, config=None, poll_interval=POLL_INTERVAL):
+        self.config = config if config is not None else {}
+        self.poll_interval = poll_interval
+        self._thread = None
+        self._stop = threading.Event()
+        self._grabbed = {}          # window id -> [(keycode, modifier mask)]
+        self._active_windows = set()
+        self._atoms = {}
+
+    # --------------------------------------------------------
+    # Lifecycle
+    # --------------------------------------------------------
+
+    def start(self):
+        if not _XLIB_AVAILABLE:
+            log("Fullscreen hotkeys disabled: python-xlib is not installed.")
+            return False
+        if self._thread is not None and self._thread.is_alive():
+            return True
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._run, name="wine-citra-fullscreen-keys", daemon=True)
+        self._thread.start()
+        return True
+
+    def stop(self):
+        self._stop.set()
+        thread = self._thread
+        if (thread is not None and thread.is_alive()
+                and thread is not threading.current_thread()):
+            thread.join(timeout=2.0)
+        self._thread = None
+
+    def _enabled(self):
+        return bool(self.config.get("intercept_fullscreen_keys", True))
+
+    def has_wine_windows(self):
+        """Return True while at least one Wine window is visible."""
+        return bool(self._active_windows)
+
+    # --------------------------------------------------------
+    # Worker
+    # --------------------------------------------------------
+
+    def _run(self):
+        try:
+            display = _xdisplay.Display()
+        except Exception as exc:
+            log(f"Fullscreen hotkeys unavailable (no X11 display): {exc}")
+            return
+
+        self._atoms.clear()
+        root = display.screen().root
+        f11 = display.keysym_to_keycode(_XK.string_to_keysym("F11"))
+        ret = display.keysym_to_keycode(_XK.string_to_keysym("Return"))
+        if not f11 or not ret:
+            log("Fullscreen hotkeys disabled: F11/Return keycodes could not be resolved.")
+            display.close()
+            return
+
+        key_specs = ((f11, 0), (ret, _X.ControlMask))
+        modifiers = (0, _X.LockMask, _X.Mod2Mask, _X.LockMask | _X.Mod2Mask)
+
+        try:
+            while not self._stop.is_set():
+                if self._enabled():
+                    self._sync_grabs(display, root, key_specs, modifiers)
+                else:
+                    self._release_grabs(display)
+
+                self._drain_events(display, root, f11, ret)
+                readable, _, _ = select.select(
+                    [display.fileno()], [], [], self.poll_interval)
+                if readable:
+                    self._drain_events(display, root, f11, ret)
+        except Exception:
+            log("Fullscreen hotkey thread stopped:\n" + traceback.format_exc())
+        finally:
+            try:
+                self._release_grabs(display)
+            except Exception:
+                pass
+            try:
+                display.close()
+            except Exception:
+                pass
+            self._thread = None
+
+    def _drain_events(self, display, root, f11, ret):
+        while display.pending_events():
+            event = display.next_event()
+            if event.type == _X.KeyPress:
+                self._handle_key(display, root, event, f11, ret)
+
+    # --------------------------------------------------------
+    # Window discovery / grabs
+    # --------------------------------------------------------
+
+    def _atom(self, display, name):
+        atom = self._atoms.get(name)
+        if atom is None:
+            atom = display.intern_atom(name)
+            self._atoms[name] = atom
+        return atom
+
+    def _client_windows(self, display, root):
+        try:
+            prop = root.get_full_property(
+                self._atom(display, "_NET_CLIENT_LIST"), _X.AnyPropertyType)
+        except Exception:
+            prop = None
+
+        if prop and prop.value:
+            for wid in prop.value:
+                try:
+                    yield display.create_resource_object("window", int(wid))
+                except Exception:
+                    continue
+            return
+
+        # Fallback for window managers without EWMH support.
+        try:
+            children = root.query_tree().children
+        except Exception:
+            return
+        for child in children:
+            try:
+                subchildren = child.query_tree().children
+            except Exception:
+                subchildren = ()
+            for window in list(subchildren) + [child]:
+                yield window
+
+    def _is_normal_window(self, display, window):
+        try:
+            prop = window.get_full_property(
+                self._atom(display, "_NET_WM_WINDOW_TYPE"), _X.AnyPropertyType)
+        except Exception:
+            return True
+        if not prop or not prop.value:
+            return True
+        normal = self._atom(display, "_NET_WM_WINDOW_TYPE_NORMAL")
+        return normal in prop.value
+
+    def _wine_windows(self, display, root):
+        windows, seen = [], set()
+        for window in self._client_windows(display, root):
+            if window.id in seen:
+                continue
+            seen.add(window.id)
+            try:
+                prop = window.get_full_property(
+                    self._atom(display, "_NET_WM_PID"), _X.AnyPropertyType)
+            except Exception:
+                continue
+            if not prop or not prop.value:
+                continue
+            try:
+                pid = int(prop.value[0])
+            except (TypeError, ValueError):
+                continue
+            if not _is_wine_process(pid):
+                continue
+            if not self._is_normal_window(display, window):
+                continue
+            windows.append((window, pid))
+        return windows
+
+    def _sync_grabs(self, display, root, key_specs, modifiers):
+        current = set()
+        grabbed_any = False
+
+        for window, pid in self._wine_windows(display, root):
+            wid = window.id
+            current.add(wid)
+            if wid in self._grabbed:
+                continue
+
+            grabbed = []
+            for keycode, base_mask in key_specs:
+                for extra in modifiers:
+                    mask = base_mask | extra
+                    try:
+                        window.grab_key(
+                            keycode, mask, False,
+                            _X.GrabModeAsync, _X.GrabModeAsync)
+                        grabbed.append((keycode, mask))
+                        grabbed_any = True
+                    except Exception as exc:
+                        log(f"Could not grab key {keycode} on window 0x{wid:x}: {exc}")
+
+            self._grabbed[wid] = grabbed
+            log(f"Intercepting F11 and Ctrl+Enter on Wine window 0x{wid:x} (pid {pid}).")
+
+        self._active_windows = set(current)
+
+        for wid in list(self._grabbed):
+            if wid not in current:
+                self._release_window(display, wid)
+
+        if grabbed_any:
+            display.flush()
+
+    def _release_window(self, display, wid):
+        keys = self._grabbed.pop(wid, [])
+        if not keys:
+            return
+        try:
+            window = display.create_resource_object("window", wid)
+        except Exception:
+            return
+        for keycode, mask in keys:
+            try:
+                window.ungrab_key(keycode, mask)
+            except Exception:
+                pass
+
+    def _release_grabs(self, display):
+        for wid in list(self._grabbed):
+            self._release_window(display, wid)
+        try:
+            display.flush()
+        except Exception:
+            pass
+
+    # --------------------------------------------------------
+    # Key handling
+    # --------------------------------------------------------
+
+    def _handle_key(self, display, root, event, f11, ret):
+        # CapsLock (LockMask) and NumLock (Mod2Mask) must not change the
+        # meaning of the shortcut.
+        state = event.state & ~(_X.LockMask | _X.Mod2Mask)
+
+        if event.detail == f11 and state == 0:
+            self._toggle_fullscreen(display, root, event.window)
+        elif event.detail == ret and state == _X.ControlMask:
+            # Consume the event: Wine must never receive Ctrl+Enter.
+            log("Blocked Ctrl+Enter on a Wine window.")
+
+    def _toggle_fullscreen(self, display, root, window):
+        state_atom = self._atom(display, "_NET_WM_STATE")
+        fullscreen_atom = self._atom(display, "_NET_WM_STATE_FULLSCREEN")
+
+        try:
+            current = window.get_full_property(state_atom, _X.AnyPropertyType)
+        except Exception:
+            return
+
+        fullscreen = bool(current and fullscreen_atom in current.value)
+        action = 0 if fullscreen else 1
+
+        message = _xprotocol.event.ClientMessage(
+            window=window,
+            client_type=state_atom,
+            data=(32, [action, fullscreen_atom, 0, 1, 0]),
+        )
+
+        try:
+            root.send_event(
+                message,
+                event_mask=(_X.SubstructureRedirectMask
+                            | _X.SubstructureNotifyMask))
+            display.flush()
+        except Exception:
+            log("Could not toggle borderless fullscreen:\n"
+                + traceback.format_exc())
+            return
+
+        # The window manager resizes the top-level Wine window, but Wine may
+        # keep its rendering child at the old work-area size. That leaves a
+        # strip of desktop/taskbar visible along the bottom edge. Give the WM
+        # a moment to settle, then make the main child fill the window again.
+        self._fit_client_children(display, window)
+
+        verb = "Disabled" if fullscreen else "Enabled"
+        log(f"{verb} borderless fullscreen for Wine window 0x{window.id:x}.")
+
+    def _fit_client_children(self, display, window, attempts=10, interval=0.12):
+        """Make Wine's main rendering child fill its toplevel window.
+
+        Games often create their rendering window at the size of the desktop
+        work area, which excludes the panel/taskbar. When the toplevel window
+        is made fullscreen the child can stay a little shorter, leaving an
+        uncovered strip at the bottom. Only resize children that already
+        occupy (almost) the whole window, so real overlay windows are left
+        alone.
+        """
+        for _ in range(attempts):
+            time.sleep(interval)
+            try:
+                geometry = window.get_geometry()
+                children = window.query_tree().children
+            except Exception:
+                return
+            resized = False
+            for child in children:
+                try:
+                    child_geometry = child.get_geometry()
+                    if (child_geometry.width < geometry.width * 0.9
+                            or child_geometry.height < geometry.height * 0.9):
+                        continue
+                    if (child_geometry.width == geometry.width
+                            and child_geometry.height == geometry.height):
+                        continue
+                    child.configure(x=0, y=0,
+                                    width=geometry.width,
+                                    height=geometry.height)
+                    resized = True
+                except Exception:
+                    continue
+            if resized:
+                try:
+                    display.flush()
+                except Exception:
+                    return
+
+
+_fullscreen_hotkeys = None
+
+
+def start_fullscreen_hotkeys(config=None):
+    """Start the X11 F11 / Ctrl+Enter interceptor (idempotent)."""
+    global _fullscreen_hotkeys
+    if _fullscreen_hotkeys is None:
+        _fullscreen_hotkeys = FullscreenKeyInterceptor(config)
+    return _fullscreen_hotkeys.start()
+
+
+def stop_fullscreen_hotkeys():
+    """Stop the interceptor and release every key grab."""
+    global _fullscreen_hotkeys
+    if _fullscreen_hotkeys is not None:
+        _fullscreen_hotkeys.stop()
+        _fullscreen_hotkeys = None
+
+
+def _wait_for_wine_windows(process=None, startup_timeout=120.0,
+                           idle_timeout=5.0, exit_grace=30.0):
+    """Keep a headless launcher alive until its Wine window disappears."""
+    interceptor = _fullscreen_hotkeys
+    if interceptor is None:
+        return
+
+    started = time.monotonic()
+    seen_window = False
+    idle_since = None
+
+    while True:
+        active = interceptor.has_wine_windows()
+        if active:
+            seen_window = True
+            idle_since = None
+        elif seen_window:
+            if idle_since is None:
+                idle_since = time.monotonic()
+            elif time.monotonic() - idle_since >= idle_timeout:
+                return
+        else:
+            elapsed = time.monotonic() - started
+            if process is not None and process.poll() is not None:
+                if elapsed >= exit_grace:
+                    return
+            elif elapsed >= startup_timeout:
+                return
+        time.sleep(0.5)
 
 
 # ============================================================
@@ -612,6 +1055,12 @@ def run(argv=None):
 
     window = MainWindow()
     window.show()
+
+    # F11 toggles borderless fullscreen on Wine windows and Ctrl+Enter is
+    # swallowed while the configuration option is enabled.
+    start_fullscreen_hotkeys(window.config)
+    app.aboutToQuit.connect(stop_fullscreen_hotkeys)
+
     return app.exec()
 
 
