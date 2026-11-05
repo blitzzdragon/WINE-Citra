@@ -1,6 +1,6 @@
 {
   "package_name": "wine-citra",
-  "version": "0.2.08",
+  "version": "0.2.11",
   "section": "utils",
   "priority": "optional",
   "architecture": "all",
@@ -15,6 +15,16 @@
     "Core",
     "UI",
     "SettingsMemory"
+  ],
+  "exclude": [
+    "LICENSE",
+    "LICENSE.*",
+    "LICENCE",
+    "LICENCE.*",
+    "README",
+    "README.*",
+    "Licensing",
+    "licensing"
   ],
   "install_dir": "/usr/lib/wine-citra",
   "output_dir": "/home/blitzzdragon",

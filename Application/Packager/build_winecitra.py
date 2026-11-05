@@ -8,6 +8,7 @@ still letting them be imported normally.
 """
 
 import argparse
+import fnmatch
 import json
 import os
 import re
@@ -26,10 +27,28 @@ DEFAULT_DEPENDS = "python3, python3-pyqt6, wine"
 DEFAULT_RECOMMENDS = "winetricks, gamemode, mangohud"
 DEFAULT_INCLUDE = ["main.py", "Core", "UI", "SettingsMemory"]
 
-COPY_IGNORE = shutil.ignore_patterns(
+# Repository files that must never be copied into the installed package.
+DEFAULT_EXCLUDE = [
+    "LICENSE", "LICENSE.*", "LICENCE", "LICENCE.*",
+    "README", "README.*",
+    "Licensing", "licensing",
+]
+
+DEFAULT_IGNORE_PATTERNS = [
     "__pycache__", "*.pyc", "*.pyo", ".git", ".gitignore",
     ".DS_Store", "*~", "*.deb",
-)
+]
+
+
+def build_ignore(exclude):
+    """Build the ignore callback used while copying application directories."""
+    return shutil.ignore_patterns(*(DEFAULT_IGNORE_PATTERNS + list(exclude)))
+
+
+def is_excluded(name, exclude):
+    """Return True when a file or directory name matches an exclude pattern."""
+    return any(fnmatch.fnmatch(name, pattern) for pattern in exclude)
+
 
 
 def fail(message):
@@ -111,15 +130,21 @@ def supports_root_owner_group():
     return "--root-owner-group" in result.stdout
 
 
-def copy_application(source_dir, app_root, include, entry_point):
+def copy_application(source_dir, app_root, include, entry_point, exclude):
     app_root.mkdir(parents=True, exist_ok=True)
+    ignore = build_ignore(exclude)
 
     for item in include:
+        item_path = Path(item)
+        parts = [part for part in item_path.parts if part not in ("", ".")]
+        if any(is_excluded(part, exclude) for part in parts):
+            continue
+
         source = source_dir / item
         target = app_root / item
 
         if source.is_dir():
-            shutil.copytree(source, target, ignore=COPY_IGNORE)
+            shutil.copytree(source, target, ignore=ignore)
         elif source.is_file():
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, target)
@@ -233,6 +258,7 @@ def build_package(config_file, output_override=None):
 
     source_dir, entry_point = resolve_source_dir(cfg)
     include = cfg.get("include") or DEFAULT_INCLUDE
+    exclude = cfg.get("exclude") or DEFAULT_EXCLUDE
     install_dir = Path(cfg.get("install_dir", f"/usr/lib/{package}"))
 
     output_dir = resolve_output_dir(cfg, output_override)
@@ -256,7 +282,7 @@ def build_package(config_file, output_override=None):
         debian_dir.mkdir(parents=True)
 
         app_root = build_dir / install_dir.relative_to("/")
-        copy_application(source_dir, app_root, include, entry_point)
+        copy_application(source_dir, app_root, include, entry_point, exclude)
 
         write_launcher(build_dir / "usr/bin" / package, install_dir)
 

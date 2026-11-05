@@ -26,7 +26,7 @@ from Core.System.dependancy_check import describe_dependencies
 # ============================================================
 
 APP_NAME = "WINE Citra"
-APP_VERSION = "0.2.08"
+APP_VERSION = "0.2.11"
 
 HOME = Path.home()
 DATA_DIR = HOME / ".local/share/wine-citra"
