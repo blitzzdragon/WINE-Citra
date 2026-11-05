@@ -1,0 +1,22 @@
+{
+  "package_name": "wine-citra",
+  "version": "0.2.08",
+  "section": "utils",
+  "priority": "optional",
+  "architecture": "all",
+  "depends": "python3, python3-pyqt6, wine",
+  "recommends": "winetricks, gamemode, mangohud",
+  "maintainer": "Blitzdragon <blitzdragon@localhost>",
+  "description": "WINE Citra - Isolated Wine Prefix Runner (Beta)",
+  "source_dir": "..",
+  "entry_point": "main.py",
+  "include": [
+    "main.py",
+    "Core",
+    "UI",
+    "SettingsMemory"
+  ],
+  "install_dir": "/usr/lib/wine-citra",
+  "output_dir": "/home/blitzzdragon",
+  "desktop_entry": true
+}
