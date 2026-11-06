@@ -22,7 +22,13 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 
-from Core.System.dependancy_check import describe_dependencies
+from Core.Additionals.direct_vulkan_translator import apply_translation_env
+from Core.System.Dependancy.dependancy_check import (
+    describe_dependencies, find_tool,
+)
+from UI.PersistanceOverlay.mangohud_layer import (
+    build_mangohud_env, resolve_mangohud, summary as mangohud_summary,
+)
 
 # Optional X11 support for the F11 / Ctrl+Enter interceptor.  The app stays
 # fully usable when python-xlib is not installed; only the key grabbing is
@@ -42,7 +48,7 @@ except Exception:       # pragma: no cover - depends on the host system
 # ============================================================
 
 APP_NAME = "WINE Citra"
-APP_VERSION = "0.2.21"
+APP_VERSION = "0.3.02"
 
 HOME = Path.home()
 DATA_DIR = HOME / ".local/share/wine-citra"
@@ -74,10 +80,23 @@ DEFAULT_CONFIG = {
     "desktop_res": "1920x1080",
     "wine_debug": False,
     "intercept_fullscreen_keys": True,
+    "trap_cursor": False,
+    "launch_monitor": "",
+    "audio_output": "",
+    "audio_input": "",
+    "enable_nvapi": True,
+    "vkd3d_raytracing": False,
+    "mangohud_position": "top-left",
+    "mangohud_scale": 100,
     "last_executable": "",
 }
 
 RES_PATTERN = re.compile(r"\d{3,5}x\d{3,5}")
+MANGOHUD_POSITIONS = (
+    "top-left", "top-center", "top-right",
+    "middle-left", "middle-center", "middle-right",
+    "bottom-left", "bottom-center", "bottom-right",
+)
 
 
 # ============================================================
@@ -127,13 +146,24 @@ def load_config():
         config["gpu_driver"] = "auto"
     if not isinstance(config["desktop_res"], str) or not RES_PATTERN.fullmatch(config["desktop_res"]):
         config["desktop_res"] = "1920x1080"
+    for key in ("audio_output", "audio_input", "launch_monitor"):
+        if not isinstance(config[key], str):
+            config[key] = ""
+    if config["mangohud_position"] not in MANGOHUD_POSITIONS:
+        config["mangohud_position"] = "top-left"
+    try:
+        config["mangohud_scale"] = max(
+            50, min(200, int(config["mangohud_scale"])))
+    except (ValueError, TypeError):
+        config["mangohud_scale"] = 100
     try:
         config["fps_limit"] = max(0, min(1000, int(config["fps_limit"])))
     except (ValueError, TypeError):
         config["fps_limit"] = 0
     for key in ("use_gamemode", "use_mangohud", "enable_esync",
                 "enable_fsync", "dxvk_hud", "virtual_desktop", "wine_debug",
-                "intercept_fullscreen_keys"):
+                "intercept_fullscreen_keys", "trap_cursor", "enable_nvapi",
+                "vkd3d_raytracing"):
         config[key] = bool(config[key])
     return config
 
@@ -181,8 +211,72 @@ GPU_ENV_VARS = (
     "__NV_PRIME_RENDER_OFFLOAD",
     "__GLX_VENDOR_LIBRARY_NAME",
     "__VK_LAYER_NV_optimus",
+    "__GL_SHADER_DISK_CACHE",
+    "__GL_SHADER_DISK_CACHE_SKIP_CLEANUP",
     "DRI_PRIME",
+    "MESA_VK_DEVICE_SELECT",
+    "VK_ICD_FILENAMES",
+    "VK_DRIVER_FILES",
 )
+
+NVIDIA_ICD_CANDIDATES = (
+    "/usr/share/vulkan/icd.d/nvidia_icd.json",
+    "/usr/share/vulkan/icd.d/nvidia_icd.x86_64.json",
+    "/etc/vulkan/icd.d/nvidia_icd.json",
+    "/etc/vulkan/icd.d/nvidia_icd.x86_64.json",
+)
+
+
+def nvidia_icd_files():
+    """Return installed NVIDIA Vulkan ICD manifests."""
+    return [path for path in NVIDIA_ICD_CANDIDATES if Path(path).is_file()]
+
+
+def nvidia_info():
+    """Best-effort NVIDIA driver information for Settings and logs."""
+    info = {"detected": any(g.vendor == "NVIDIA" for g in list_gpus()),
+            "driver": "", "name": "", "icd": bool(nvidia_icd_files())}
+    smi = find_tool("nvidia-smi")
+    if smi:
+        try:
+            out = subprocess.run(
+                [smi, "--query-gpu=name,driver_version",
+                 "--format=csv,noheader"],
+                capture_output=True, text=True, timeout=3).stdout.strip()
+            if out:
+                first = out.splitlines()[0]
+                parts = [p.strip() for p in first.split(",")]
+                if parts:
+                    info["name"] = parts[0]
+                if len(parts) > 1:
+                    info["driver"] = parts[1]
+        except (OSError, subprocess.SubprocessError):
+            pass
+    if not info["driver"]:
+        try:
+            text = Path("/proc/driver/nvidia/version").read_text(
+                encoding="utf-8", errors="ignore")
+            match = re.search(r"Kernel Module\s+([\d.]+)", text)
+            if match:
+                info["driver"] = match.group(1)
+        except OSError:
+            pass
+    return info
+
+
+def _mesa_vulkan_id(gpu):
+    """Return Mesa's vendor:device selector for a PCI GPU."""
+    base = Path("/sys/bus/pci/devices") / gpu.pci
+    try:
+        vendor = (base / "vendor").read_text().strip().lower()
+        device = (base / "device").read_text().strip().lower()
+    except OSError:
+        return None
+    if vendor.startswith("0x"):
+        vendor = vendor[2:]
+    if device.startswith("0x"):
+        device = device[2:]
+    return f"{vendor}:{device}" if vendor and device else None
 
 
 class GPU:
@@ -299,17 +393,44 @@ def _env_for_gpu(target, gpus, driver):
         nvidia_proprietary = False
 
     if nvidia_proprietary:
-        return {"__NV_PRIME_RENDER_OFFLOAD": "1",
-                "__GLX_VENDOR_LIBRARY_NAME": "nvidia",
-                "__VK_LAYER_NV_optimus": "NVIDIA_only"}
+        env = {"__NV_PRIME_RENDER_OFFLOAD": "1",
+               "__GLX_VENDOR_LIBRARY_NAME": "nvidia",
+               "__VK_LAYER_NV_optimus": "NVIDIA_only",
+               # Keep the proprietary driver's compiled shader cache alive.
+               "__GL_SHADER_DISK_CACHE": "1",
+               "__GL_SHADER_DISK_CACHE_SKIP_CLEANUP": "1"}
+        # Pin Vulkan to the NVIDIA ICD when the manifest exists.  This is
+        # what makes PRIME offload reliable on hybrid laptops.
+        icds = nvidia_icd_files()
+        if icds:
+            env["VK_ICD_FILENAMES"] = ":".join(icds)
+            env["VK_DRIVER_FILES"] = ":".join(icds)
+        return env
 
     env = {"DRI_PRIME": target.dri_tag}
+    mesa_id = _mesa_vulkan_id(target)
+    if mesa_id:
+        env["MESA_VK_DEVICE_SELECT"] = mesa_id
     # If the NVIDIA proprietary driver owns OpenGL on this machine, tell
     # GLVND to use Mesa for the non-NVIDIA GPU we picked.
     if target.vendor != "NVIDIA" and any(
             g.vendor == "NVIDIA" and g.driver == "nvidia" for g in gpus):
         env["__GLX_VENDOR_LIBRARY_NAME"] = "mesa"
     return env
+
+
+def _select_gpu(choice, gpus):
+    """Resolve a GPU choice to a GPU object.  Returns (target, note)."""
+    note = ""
+    if isinstance(choice, str) and choice.startswith("pci:"):
+        target = next((g for g in gpus if g.pci == choice[4:]), None)
+        if target is not None:
+            return target, note
+        note = "Selected GPU not found, using Auto. "
+        choice = "auto"
+    if choice == "integrated":
+        return _pick_integrated(gpus), note
+    return _pick_dedicated(gpus), note
 
 
 def plan_gpu(choice, driver="auto", gpus=None):
@@ -322,25 +443,28 @@ def plan_gpu(choice, driver="auto", gpus=None):
     if len(gpus) < 2:
         return {}, "Only one GPU detected - nothing to select."
 
-    target = None
-    if isinstance(choice, str) and choice.startswith("pci:"):
-        target = next((g for g in gpus if g.pci == choice[4:]), None)
-        if target is None:
-            note = "Selected GPU not found, using Auto. "
-            choice = "auto"
+    target, note = _select_gpu(choice, gpus)
     if target is None:
         if choice == "integrated":
-            target = _pick_integrated(gpus)
-            if target is None:
-                return {}, "No integrated GPU found - using system default."
-        else:                           # auto / dedicated
-            target = _pick_dedicated(gpus)
-            if target is None:
-                return {}, "No dedicated GPU found - using system default."
+            return {}, note + "No integrated GPU found - using system default."
+        return {}, note + "No dedicated GPU found - using system default."
 
     env = _env_for_gpu(target, gpus, driver)
     kind = "integrated" if target.kind == "integrated" else "dedicated"
     return env, f"{note}Using {target.name} ({kind})."
+
+
+def gpu_is_nvidia(config, env=None):
+    """Return True when the launch will end up on an NVIDIA GPU."""
+    if env and env.get("__GLX_VENDOR_LIBRARY_NAME") == "nvidia":
+        return True
+    gpus = list_gpus()
+    if not gpus:
+        return False
+    if len(gpus) < 2 or config.get("gpu_choice", "auto") == "default":
+        return any(g.vendor == "NVIDIA" for g in gpus)
+    target, _ = _select_gpu(config.get("gpu_choice", "auto"), gpus)
+    return bool(target and target.vendor == "NVIDIA")
 
 
 def apply_gpu_env(config, env):
@@ -348,6 +472,104 @@ def apply_gpu_env(config, env):
         env.pop(key, None)
     plan, _ = plan_gpu(config.get("gpu_choice", "auto"), config.get("gpu_driver", "auto"))
     env.update(plan)
+
+
+# ============================================================
+# AUDIO DEVICES / MONITORS / GAMEMODE
+# ============================================================
+
+def _pactl_json(arguments):
+    pactl = find_tool("pactl")
+    if not pactl:
+        return []
+    try:
+        result = subprocess.run(
+            [pactl, "--format=json", *arguments],
+            capture_output=True, text=True, timeout=5)
+        if result.returncode != 0:
+            return []
+        data = json.loads(result.stdout)
+        return data if isinstance(data, list) else []
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return []
+
+
+def list_audio_devices():
+    """Return selectable PulseAudio/PipeWire output and input devices."""
+    outputs = [
+        {"name": entry.get("name", ""),
+         "description": entry.get("description") or entry.get("name", "")}
+        for entry in _pactl_json(["list", "sinks"])
+        if entry.get("name")
+    ]
+    inputs = [
+        {"name": entry.get("name", ""),
+         "description": entry.get("description") or entry.get("name", "")}
+        for entry in _pactl_json(["list", "sources"])
+        if entry.get("name")
+    ]
+    return {"outputs": outputs, "inputs": inputs}
+
+
+def list_monitors():
+    """Return connected XRandR monitors with their absolute geometry."""
+    xrandr = find_tool("xrandr")
+    if not xrandr:
+        return []
+    try:
+        text = subprocess.run(
+            [xrandr, "--listmonitors"], capture_output=True,
+            text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+
+    monitors = []
+    pattern = re.compile(
+        r"^\s*(\d+):\s+\+?\*?(\S+)\s+"
+        r"(\d+)/\d+x(\d+)/\d+\+(-?\d+)\+(-?\d+)")
+    for line in text.splitlines():
+        match = pattern.match(line)
+        if not match:
+            continue
+        index, name, width, height, x, y = match.groups()
+        monitors.append({
+            "index": int(index),
+            "name": name,
+            "width": int(width),
+            "height": int(height),
+            "x": int(x),
+            "y": int(y),
+        })
+    return monitors
+
+
+def selected_monitor(config):
+    """Return the monitor chosen in Settings, or the primary monitor."""
+    monitors = list_monitors()
+    if not monitors:
+        return None
+    wanted = (config or {}).get("launch_monitor") or ""
+    if wanted:
+        for monitor in monitors:
+            if monitor["name"] == wanted:
+                return monitor
+    return monitors[0]
+
+
+def gamemode_status():
+    """Return (available, description) for the GameMode integration."""
+    runner = find_tool("gamemoderun")
+    daemon = find_tool("gamemoded")
+    if not runner:
+        return False, "GameMode is not installed (gamemoderun was not found)."
+    details = [f"gamemoderun: {runner}"]
+    details.append(f"gamemoded: {daemon}" if daemon
+                   else "gamemoded: not found (GameMode may not activate)")
+    return True, "; ".join(details)
+
+
+def mangohud_status(config):
+    return mangohud_summary(config, selected_monitor(config))
 
 
 # ============================================================
@@ -435,7 +657,7 @@ def to_windows_path(unix_path):
 # WINE ENVIRONMENT / COMMAND
 # ============================================================
 
-def build_env(config, prefix, is_new_prefix):
+def build_env(config, prefix, is_new_prefix, game_launch=False):
     env = os.environ.copy()
     env["WINEPREFIX"] = str(prefix)
     env["WINEDEBUG"] = "warn+all" if config["wine_debug"] else "-all"
@@ -462,18 +684,36 @@ def build_env(config, prefix, is_new_prefix):
     else:
         env.pop("DXVK_FRAME_RATE", None)
 
+    # Audio: an empty selection means "use the system default", so the
+    # variables are removed rather than set to an empty string.
+    for key, selection in (("PULSE_SINK", config["audio_output"]),
+                           ("PULSE_SOURCE", config["audio_input"])):
+        selection = str(selection or "").strip()
+        if selection:
+            env[key] = selection
+        else:
+            env.pop(key, None)
+
     apply_gpu_env(config, env)
+    apply_translation_env(env, config, prefix,
+                          nvidia=gpu_is_nvidia(config, env))
+
+    if game_launch and config["use_mangohud"]:
+        env.update(build_mangohud_env(config, selected_monitor(config)))
+    else:
+        env.pop("MANGOHUD", None)
+        env.pop("MANGOHUD_CONFIG", None)
     return env
 
 
 def build_command(config, wine, executable, arguments):
     cmd = []
     if config["use_gamemode"]:
-        gm = shutil.which("gamemoderun")
+        gm = find_tool("gamemoderun")
         if gm:
             cmd.append(gm)
     if config["use_mangohud"]:
-        mh = shutil.which("mangohud")
+        mh = resolve_mangohud()
         if mh:
             cmd.append(mh)
 
@@ -513,7 +753,7 @@ def start_wine(config, executable, arguments=None, prefix_override=None):
     prefix.mkdir(parents=True, exist_ok=True)
     is_new = not prefix_exists(prefix)
 
-    env = build_env(config, prefix, is_new)
+    env = build_env(config, prefix, is_new, game_launch=True)
     try:
         cmd = build_command(config, wine, executable, arguments)
     except ValueError as e:
@@ -521,6 +761,21 @@ def start_wine(config, executable, arguments=None, prefix_override=None):
 
     gpu_vars = {k: env[k] for k in GPU_ENV_VARS if k in env}
     gpu_note = plan_gpu(config["gpu_choice"], config["gpu_driver"])[1]
+    gamemode_ok, gamemode_note = gamemode_status()
+    mangohud_note = (mangohud_status(config) if config["use_mangohud"]
+                     else "disabled")
+    audio_note = (f"output={config['audio_output'] or 'system default'}, "
+                  f"input={config['audio_input'] or 'system default'}")
+    nvidia = nvidia_info()
+    nvidia_note = (f"{nvidia['name'] or 'NVIDIA GPU'} "
+                   f"(driver {nvidia['driver'] or 'unknown'})"
+                   if nvidia["detected"] else "no NVIDIA GPU detected")
+    monitor = selected_monitor(config)
+    monitor_note = (f"{monitor['name']} ({monitor['width']}x{monitor['height']})"
+                    if monitor else "system default")
+
+    if config["use_gamemode"] and not gamemode_ok:
+        log("GameMode was requested but is unavailable: " + gamemode_note)
 
     logfile = application_log(executable)
     with open(logfile, "a", encoding="utf-8") as out:
@@ -530,6 +785,11 @@ def start_wine(config, executable, arguments=None, prefix_override=None):
                   f"Prefix: {prefix}\n"
                   f"GPU: {gpu_note}\n"
                   f"GPU env: {gpu_vars or 'none'}\n"
+                  f"NVIDIA: {nvidia_note}\n"
+                  f"GameMode: {gamemode_note if config['use_gamemode'] else 'disabled'}\n"
+                  f"MangoHud: {mangohud_note}\n"
+                  f"Audio: {audio_note}\n"
+                  f"Monitor: {monitor_note}\n"
                   f"Command: {shlex.join(cmd)}\n\n")
         out.flush()
         try:
@@ -547,6 +807,9 @@ def start_wine(config, executable, arguments=None, prefix_override=None):
             pass
 
     log(f"Launched {executable}\nPrefix: {prefix}\nGPU: {gpu_note}\nGPU env: {gpu_vars or 'none'}\n"
+        f"NVIDIA: {nvidia_note}\n"
+        f"GameMode: {gamemode_note if config['use_gamemode'] else 'disabled'}\n"
+        f"MangoHud: {mangohud_note}\nAudio: {audio_note}\nMonitor: {monitor_note}\n"
         f"Command: {shlex.join(cmd)}")
     return proc, prefix, cmd
 
@@ -579,7 +842,10 @@ def launch_from_desktop(executable, arguments):
     # Keep this small process alive while the game runs, otherwise the
     # interceptor would exit together with the launcher and F11 would go
     # back to Wine's built-in fullscreen handling.
-    if config.get("intercept_fullscreen_keys", True) and start_fullscreen_hotkeys(config):
+    if (config.get("intercept_fullscreen_keys", True)
+            or config.get("trap_cursor", False)
+            or config.get("launch_monitor", "")) \
+            and start_fullscreen_hotkeys(config):
         try:
             _wait_for_wine_windows(process)
         except KeyboardInterrupt:
@@ -648,10 +914,12 @@ def _is_wine_process(pid):
 
 
 class FullscreenKeyInterceptor:
-    """Grab F11 and Ctrl+Enter on Wine windows.
+    """Grab F11 and Ctrl+Enter on Wine windows and manage window helpers.
 
     F11 toggles EWMH fullscreen (borderless fullscreen) on the focused Wine
     window. Ctrl+Enter is swallowed so the Windows application never sees it.
+    The same X11 worker optionally confines the pointer to the focused Wine
+    window and moves new game windows onto the monitor selected in Settings.
     """
 
     POLL_INTERVAL = 0.5
@@ -664,6 +932,9 @@ class FullscreenKeyInterceptor:
         self._grabbed = {}          # window id -> [(keycode, modifier mask)]
         self._active_windows = set()
         self._atoms = {}
+        self._pointer_window = None
+        self._pointer_error_logged = False
+        self._placed_windows = set()
 
     # --------------------------------------------------------
     # Lifecycle
@@ -724,7 +995,9 @@ class FullscreenKeyInterceptor:
                 if self._enabled():
                     self._sync_grabs(display, root, key_specs, modifiers)
                 else:
-                    self._release_grabs(display)
+                    self._sync_grabs(display, root, key_specs, modifiers,
+                                     grab_keys=False)
+                self._update_pointer(display, root)
 
                 self._drain_events(display, root, f11, ret)
                 readable, _, _ = select.select(
@@ -736,6 +1009,10 @@ class FullscreenKeyInterceptor:
         finally:
             try:
                 self._release_grabs(display)
+            except Exception:
+                pass
+            try:
+                self._release_pointer(display)
             except Exception:
                 pass
             try:
@@ -824,14 +1101,24 @@ class FullscreenKeyInterceptor:
             windows.append((window, pid))
         return windows
 
-    def _sync_grabs(self, display, root, key_specs, modifiers):
+    def _sync_grabs(self, display, root, key_specs, modifiers,
+                    grab_keys=True):
         current = set()
         grabbed_any = False
+        if not grab_keys:
+            # Drop any key grabs left over from when interception was on.
+            self._release_grabs(display)
+        wine_windows = self._wine_windows(display, root)
 
-        for window, pid in self._wine_windows(display, root):
+        for window, pid in wine_windows:
             wid = window.id
             current.add(wid)
-            if wid in self._grabbed:
+            if wid in self._grabbed and (
+                    not grab_keys or self._grabbed[wid]):
+                continue
+            if not grab_keys:
+                # Still track the window for cursor trapping and placement.
+                self._grabbed[wid] = []
                 continue
 
             grabbed = []
@@ -855,6 +1142,9 @@ class FullscreenKeyInterceptor:
         for wid in list(self._grabbed):
             if wid not in current:
                 self._release_window(display, wid)
+
+        self._placed_windows.intersection_update(current)
+        self._place_on_selected_monitor(display, wine_windows)
 
         if grabbed_any:
             display.flush()
@@ -880,6 +1170,92 @@ class FullscreenKeyInterceptor:
             display.flush()
         except Exception:
             pass
+
+    # --------------------------------------------------------
+    # Cursor trapping / monitor targeting
+    # --------------------------------------------------------
+
+    def _active_window(self, display, root):
+        try:
+            prop = root.get_full_property(
+                self._atom(display, "_NET_ACTIVE_WINDOW"), _X.AnyPropertyType)
+        except Exception:
+            return None
+        if not prop or not prop.value:
+            return None
+        try:
+            return display.create_resource_object(
+                "window", int(prop.value[0]))
+        except Exception:
+            return None
+
+    def _update_pointer(self, display, root):
+        """Confine the pointer to the focused Wine window when requested."""
+        if not self.config.get("trap_cursor", False):
+            self._release_pointer(display)
+            return
+
+        focused = self._active_window(display, root)
+        if focused is None or focused.id not in self._active_windows:
+            self._release_pointer(display)
+            return
+        if self._pointer_window == focused.id:
+            return
+
+        self._release_pointer(display)
+        try:
+            status = focused.grab_pointer(
+                True, 0, _X.GrabModeAsync, _X.GrabModeAsync,
+                focused, _X.NONE, _X.CurrentTime)
+            display.flush()
+        except Exception as exc:
+            if not self._pointer_error_logged:
+                log(f"Could not trap the cursor: {exc}")
+                self._pointer_error_logged = True
+            return
+
+        if status == _X.GrabSuccess:
+            self._pointer_window = focused.id
+            self._pointer_error_logged = False
+            log(f"Cursor trapped inside Wine window 0x{focused.id:x}.")
+        elif status == _X.AlreadyGrabbed:
+            self._pointer_window = focused.id
+        elif not self._pointer_error_logged:
+            log(f"Could not trap the cursor (X11 grab status {status}).")
+            self._pointer_error_logged = True
+
+    def _release_pointer(self, display):
+        if self._pointer_window is None:
+            return
+        try:
+            display.ungrab_pointer(_X.CurrentTime)
+            display.flush()
+            log("Cursor released.")
+        except Exception:
+            pass
+        self._pointer_window = None
+
+    def _place_on_selected_monitor(self, display, wine_windows):
+        """Move each newly seen Wine window onto the selected monitor."""
+        wanted = self.config.get("launch_monitor") or ""
+        if not wanted:
+            return
+        monitor = next(
+            (m for m in list_monitors() if m["name"] == wanted), None)
+        if not monitor:
+            return
+
+        for window, _pid in wine_windows:
+            if window.id in self._placed_windows:
+                continue
+            self._placed_windows.add(window.id)
+            try:
+                window.configure(x=monitor["x"], y=monitor["y"])
+                display.flush()
+                log(f"Moved Wine window 0x{window.id:x} to monitor "
+                    f"{monitor['name']} at {monitor['x']},{monitor['y']}.")
+            except Exception:
+                pass
 
     # --------------------------------------------------------
     # Key handling

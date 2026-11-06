@@ -20,7 +20,7 @@ from PyQt6.QtWidgets import (
 )
 
 from Core.Runtime.application_runtime import (
-    APP_NAME, APP_VERSION, LOG_DIR, PREFIX_BASE,
+    APP_NAME, APP_VERSION, LOG_DIR, PREFIX_BASE, PROJECT_ROOT,
     apply_gpu_env, build_env, get_prefix_arch, is_inside_prefix_base,
     list_prefixes, load_config, log, prefix_exists, resolve_wine, safe_name,
 )
@@ -36,6 +36,26 @@ def open_path(parent, path):
         QMessageBox.warning(parent, APP_NAME, f"Path does not exist:\n{path}")
         return
     QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
+
+
+SETTINGS_MEMORY = PROJECT_ROOT / "SettingsMemory" / "settings_selection.json"
+
+
+def load_selection():
+    try:
+        data = json.loads(SETTINGS_MEMORY.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_selection(data):
+    try:
+        SETTINGS_MEMORY.parent.mkdir(parents=True, exist_ok=True)
+        SETTINGS_MEMORY.write_text(
+            json.dumps(data, indent=4) + "\n", encoding="utf-8")
+    except OSError:
+        pass
 
 
 # ============================================================
@@ -427,6 +447,13 @@ class MainWindow(QWidget):
         self.tabs.addTab(self.logs_tab, "Logs")
         layout.addWidget(self.tabs)
 
+        self._selection = load_selection()
+        try:
+            self.tabs.setCurrentIndex(int(self._selection.get("tab", 0)))
+        except (TypeError, ValueError):
+            self.tabs.setCurrentIndex(0)
+        self.tabs.currentChanged.connect(self.remember_tab)
+
         self.toolbar = StatusToolbar()
         self.toolbar.refreshRequested.connect(self.refresh_all)
         self.toolbar.openPrefixesRequested.connect(
@@ -454,6 +481,10 @@ class MainWindow(QWidget):
 
     def on_settings_saved(self):
         self.launcher_tab.update_exe_info()
+
+    def remember_tab(self, index):
+        self._selection["tab"] = index
+        save_selection(self._selection)
 
     # --------------------------------------------------------
     # Refresh
