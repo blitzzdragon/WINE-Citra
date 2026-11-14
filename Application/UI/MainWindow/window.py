@@ -12,21 +12,24 @@ import urllib.request
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QThread, QTimer, QUrl, pyqtSignal
+from PyQt6.QtGui import QFont, QIcon, QKeySequence, QShortcut
 from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
-    QHBoxLayout, QInputDialog, QLabel, QListWidget, QListWidgetItem,
-    QMessageBox, QProgressBar, QPushButton, QSplitter, QTabWidget,
+    QApplication, QGridLayout, QHBoxLayout, QInputDialog, QLabel,
+    QListWidget, QListWidgetItem,
+    QMessageBox, QProgressBar, QPushButton, QSizePolicy, QSplitter, QTabWidget,
     QVBoxLayout, QWidget,
 )
 
 from Core.Runtime.application_runtime import (
-    APP_NAME, APP_VERSION, LOG_DIR, PREFIX_BASE, PROJECT_ROOT,
+    APP_ICON_FILE, APP_NAME, APP_VERSION, LOG_DIR, PREFIX_BASE, PROJECT_ROOT,
     apply_gpu_env, build_env, get_prefix_arch, is_inside_prefix_base,
     list_prefixes, load_config, log, prefix_exists, resolve_wine, safe_name,
 )
 from UI.Tabs.logs import LogsTab
 from UI.Tabs.overview import LauncherTab
 from UI.Tabs.settings import SettingsTab
+from UI.Tabs.updates import UpdatesTab
 from UI.Toolbar.toolbar import StatusToolbar
 
 
@@ -163,7 +166,12 @@ class PrefixesTab(QWidget):
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         self.prefix_list = QListWidget()
+        self.prefix_list.setAccessibleName("Wine prefixes")
+        self.prefix_list.setAccessibleDescription(
+            "Select a prefix to inspect or manage it.")
         self.prefix_list.currentItemChanged.connect(self.update_prefix_details)
+        self.prefix_list.itemDoubleClicked.connect(
+            lambda *_: self.open_selected_prefix())
         splitter.addWidget(self.prefix_list)
 
         details = QWidget()
@@ -174,6 +182,8 @@ class PrefixesTab(QWidget):
         self.prefix_name_label.setFont(f)
         self.prefix_path_label = QLabel("")
         self.prefix_path_label.setWordWrap(True)
+        self.prefix_path_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
         self.prefix_arch_label = QLabel("")
         dl.addWidget(self.prefix_name_label)
         dl.addWidget(self.prefix_path_label)
@@ -183,7 +193,7 @@ class PrefixesTab(QWidget):
         splitter.setSizes([260, 420])
         layout.addWidget(splitter, 1)
 
-        row1 = QHBoxLayout()
+        row1 = QGridLayout()
         self.btn_new_prefix = QPushButton("New Prefix...")
         self.btn_new_prefix.clicked.connect(self.new_prefix)
         self.btn_dxvk = QPushButton("Install DXVK")
@@ -192,9 +202,10 @@ class PrefixesTab(QWidget):
         self.btn_winetricks.clicked.connect(self.run_winetricks)
         self.btn_winecfg = QPushButton("Winecfg")
         self.btn_winecfg.clicked.connect(self.run_winecfg)
-        for b in (self.btn_new_prefix, self.btn_dxvk,
-                  self.btn_winetricks, self.btn_winecfg):
-            row1.addWidget(b)
+        for index, b in enumerate((self.btn_new_prefix, self.btn_dxvk,
+                                   self.btn_winetricks, self.btn_winecfg)):
+            b.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            row1.addWidget(b, index // 2, index % 2)
         layout.addLayout(row1)
 
         row2 = QHBoxLayout()
@@ -205,6 +216,7 @@ class PrefixesTab(QWidget):
         refresh = QPushButton("Refresh")
         refresh.clicked.connect(self.window.refresh_prefixes)
         for b in (open_btn, del_btn, refresh):
+            b.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             row2.addWidget(b)
         layout.addLayout(row2)
 
@@ -422,7 +434,8 @@ class MainWindow(QWidget):
         super().__init__()
         self.config = load_config()
         self.running = {}            # pid -> (Popen, name)
-
+        self._base_font = QApplication.font()
+        self.apply_accessibility_scale()
         self.build_ui()
         self.refresh_all()
 
@@ -432,19 +445,38 @@ class MainWindow(QWidget):
 
     def build_ui(self):
         self.setWindowTitle(f"{APP_NAME} {APP_VERSION}")
-        self.resize(820, 640)
+        self.setWindowIcon(QIcon(str(APP_ICON_FILE)))
+        self.resize(900, 680)
+        self.setMinimumSize(760, 540)
+        self.setStyleSheet(
+            "QTabWidget::pane { border: 1px solid palette(mid); "
+            "border-radius: 6px; top: -1px; }"
+            "QTabBar::tab { padding: 8px 14px; margin-right: 3px; }"
+            "QTabBar::tab:selected { font-weight: 600; }"
+            "QPushButton, QToolButton { min-height: 29px; padding: 4px 9px; }"
+            "QLineEdit, QComboBox, QSpinBox { min-height: 27px; padding: 3px; }"
+            "QPushButton:hover, QToolButton:hover { "
+            "border-color: palette(highlight); }"
+            "QPushButton:focus, QToolButton:focus, QLineEdit:focus, "
+            "QComboBox:focus, QSpinBox:focus { "
+            "border: 2px solid palette(highlight); }")
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 14, 14, 10)
+        layout.setSpacing(10)
 
         self.tabs = QTabWidget()
+        self.tabs.setAccessibleName("Main navigation")
         self.launcher_tab = LauncherTab(self)
         self.settings_tab = SettingsTab(self)
         self.prefixes_tab = PrefixesTab(self)
         self.logs_tab = LogsTab(self)
+        self.updates_tab = UpdatesTab(self)
         self.tabs.addTab(self.launcher_tab, "Launcher")
         self.tabs.addTab(self.settings_tab, "Settings")
         self.tabs.addTab(self.prefixes_tab, "Prefixes")
         self.tabs.addTab(self.logs_tab, "Logs")
+        self.tabs.addTab(self.updates_tab, "Updates")
         layout.addWidget(self.tabs)
 
         self._selection = load_selection()
@@ -453,6 +485,10 @@ class MainWindow(QWidget):
         except (TypeError, ValueError):
             self.tabs.setCurrentIndex(0)
         self.tabs.currentChanged.connect(self.remember_tab)
+        self.tabs.tabBarClicked.connect(self._tab_bar_clicked)
+
+        self._refresh_shortcut = QShortcut(QKeySequence("F5"), self)
+        self._refresh_shortcut.activated.connect(self.refresh_all)
 
         self.toolbar = StatusToolbar()
         self.toolbar.refreshRequested.connect(self.refresh_all)
@@ -479,12 +515,31 @@ class MainWindow(QWidget):
     def set_status(self, text):
         self.toolbar.set_status(text)
 
+    def apply_accessibility_scale(self, scale=None):
+        scale = self.config.get("ui_text_scale", 100) if scale is None else scale
+        try:
+            scale = int(scale)
+        except (TypeError, ValueError):
+            scale = 100
+        font = QFont(self._base_font)
+        points = font.pointSizeF()
+        if points <= 0:
+            points = 10.0
+        font.setPointSizeF(max(8.0, points * scale / 100))
+        QApplication.setFont(font)
+
     def on_settings_saved(self):
+        self.apply_accessibility_scale()
         self.launcher_tab.update_exe_info()
 
     def remember_tab(self, index):
         self._selection["tab"] = index
         save_selection(self._selection)
+
+    def _tab_bar_clicked(self, index):
+        # Also refresh when the already-active Updates tab is clicked again.
+        if self.tabs.widget(index) is self.updates_tab:
+            self.updates_tab.check_updates()
 
     # --------------------------------------------------------
     # Refresh
@@ -509,8 +564,10 @@ class MainWindow(QWidget):
                 event.ignore()
                 return
             worker.wait(5000)
-        # Wine programs are started in their own session, so they
-        # keep running after this window is closed.
+        # Flush any settings change that is still inside the autosave delay.
+        self.settings_tab.flush_autosave()
+        # Wine programs and their detached application shell keep running
+        # after this window is closed.
         event.accept()
 
 

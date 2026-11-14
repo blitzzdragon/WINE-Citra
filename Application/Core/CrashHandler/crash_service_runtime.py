@@ -11,7 +11,7 @@ def global_exception_handler(exc_type, exc_value, exc_tb):
     log(text)
     try:
         from UI.Dialouges.crash_popup import show_crash_dialog
-        show_crash_dialog(GLOBAL_LOG)
+        show_crash_dialog(GLOBAL_LOG, exc_type, exc_value, text)
     except Exception:
         # Never let the reporting path itself raise.
         pass

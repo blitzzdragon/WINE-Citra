@@ -24,8 +24,8 @@ PROJECT_DIR = PACKAGER_DIR.parent
 DEFAULT_CONFIG = PACKAGER_DIR / "Configuration" / "winecitra_config.json"
 
 DEFAULT_DEPENDS = "python3, python3-pyqt6, python3-xlib, wine"
-DEFAULT_RECOMMENDS = "winetricks, gamemode, mangohud"
-DEFAULT_INCLUDE = ["main.py", "Core", "UI", "SettingsMemory"]
+DEFAULT_RECOMMENDS = "winetricks, gamemode"
+DEFAULT_INCLUDE = ["main.py", "Core", "UI", "SettingsMemory", "Assets"]
 
 # Repository files that must never be copied into the installed package.
 DEFAULT_EXCLUDE = [
@@ -194,7 +194,7 @@ def write_desktop_file(path, package):
         "Comment=Run Windows applications using isolated Wine prefixes\n"
         f"Exec=/usr/bin/{package} %f\n"
         f"TryExec=/usr/bin/{package}\n"
-        "Icon=wine\n"
+        "Icon=wine-citra\n"
         "Terminal=false\n"
         "Categories=Utility;\n"
         "Keywords=wine;windows;prefix;launcher;\n"
@@ -213,6 +213,9 @@ def write_maintainer_scripts(debian_dir):
         "\n"
         "if command -v update-desktop-database >/dev/null 2>&1; then\n"
         "    update-desktop-database -q /usr/share/applications || true\n"
+        "fi\n"
+        "if command -v gtk-update-icon-cache >/dev/null 2>&1; then\n"
+        "    gtk-update-icon-cache -q -f /usr/share/icons/hicolor || true\n"
         "fi\n"
         "\n"
         "exit 0\n"
@@ -287,6 +290,14 @@ def build_package(config_file, output_override=None):
         write_launcher(build_dir / "usr/bin" / package, install_dir)
 
         if cfg.get("desktop_entry", True):
+            icon_source = source_dir / "Assets" / "windows_icon.svg"
+            if not icon_source.is_file():
+                fail(f"Application icon not found: {icon_source}")
+            icon_target = (
+                build_dir / "usr/share/icons/hicolor/scalable/apps"
+                / "wine-citra.svg")
+            icon_target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(icon_source, icon_target)
             write_desktop_file(
                 build_dir / "usr/share/applications" / f"{package}.desktop",
                 package)

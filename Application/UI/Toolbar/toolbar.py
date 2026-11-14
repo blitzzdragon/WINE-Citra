@@ -16,6 +16,8 @@ class StatusToolbar(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
 
         self.status_label = QLabel("Ready")
+        self.status_label.setAccessibleName("Application status")
+        self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label, 1)
 
         self.refresh_button = QPushButton("Refresh")

@@ -20,7 +20,6 @@ OPTIONAL_TOOLS = {
     "winetricks": "Winetricks",
     "gamemoderun": "GameMode",
     "gamemoded": "GameMode daemon",
-    "mangohud": "MangoHud",
     "pactl": "PulseAudio/PipeWire control (audio devices)",
     "xrandr": "XRandR (monitor targeting)",
     "lspci": "PCI utilities (GPU names)",

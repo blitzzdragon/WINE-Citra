@@ -1,20 +1,21 @@
 {
   "package_name": "wine-citra",
-  "version": "0.3.02",
+  "version": "0.3.66",
   "section": "utils",
   "priority": "optional",
   "architecture": "all",
   "depends": "python3, python3-pyqt6, python3-xlib, wine",
-  "recommends": "winetricks, gamemode, mangohud, pulseaudio-utils, mesa-vulkan-drivers",
+  "recommends": "winetricks, gamemode, pulseaudio-utils, mesa-vulkan-drivers",
   "maintainer": "Blitzdragon <blitzdragon@localhost>",
-  "description": "WINE Citra - Isolated Wine Prefix Runner (Beta)",
+  "description": "WINE Citra - Windows application launcher and Wine prefix manager",
   "source_dir": "..",
   "entry_point": "main.py",
   "include": [
     "main.py",
     "Core",
     "UI",
-    "SettingsMemory"
+    "SettingsMemory",
+    "Assets"
   ],
   "exclude": [
     "LICENSE",

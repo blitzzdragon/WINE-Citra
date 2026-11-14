@@ -26,9 +26,6 @@ from Core.Additionals.direct_vulkan_translator import apply_translation_env
 from Core.System.Dependancy.dependancy_check import (
     describe_dependencies, find_tool,
 )
-from UI.PersistanceOverlay.mangohud_layer import (
-    build_mangohud_env, resolve_mangohud, summary as mangohud_summary,
-)
 
 # Optional X11 support for the F11 / Ctrl+Enter interceptor.  The app stays
 # fully usable when python-xlib is not installed; only the key grabbing is
@@ -48,7 +45,7 @@ except Exception:       # pragma: no cover - depends on the host system
 # ============================================================
 
 APP_NAME = "WINE Citra"
-APP_VERSION = "0.3.02"
+APP_VERSION = "0.3.66"
 
 HOME = Path.home()
 DATA_DIR = HOME / ".local/share/wine-citra"
@@ -59,7 +56,14 @@ CONFIG_FILE = CONFIG_DIR / "settings.json"
 GLOBAL_LOG = LOG_DIR / "wine-citra.log"
 SHARED_PREFIX = PREFIX_BASE / "default"
 
+# The detached application shell owns hotkeys and window helpers so they
+# keep working after the launcher window is closed.
+SHELL_LOCK_FILE = DATA_DIR / "application-shell.lock"
+SHELL_HEARTBEAT_FILE = DATA_DIR / "application-shell.heartbeat"
+SHELL_LOG = LOG_DIR / "application-shell.log"
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+APP_ICON_FILE = PROJECT_ROOT / "Assets" / "windows_icon.svg"
 
 for _d in (DATA_DIR, PREFIX_BASE, LOG_DIR, CONFIG_DIR):
     _d.mkdir(parents=True, exist_ok=True)
@@ -71,7 +75,6 @@ DEFAULT_CONFIG = {
     "gpu_choice": "auto",          # auto / dedicated / integrated / default / pci:<address>
     "gpu_driver": "auto",          # auto / mesa / nvidia (advanced override)
     "use_gamemode": False,
-    "use_mangohud": False,
     "enable_esync": True,
     "enable_fsync": False,
     "dxvk_hud": False,
@@ -86,19 +89,15 @@ DEFAULT_CONFIG = {
     "audio_input": "",
     "enable_nvapi": True,
     "vkd3d_raytracing": False,
-    "mangohud_position": "top-left",
-    "mangohud_scale": 100,
     "last_executable": "",
+    "show_prerelease": False,
+    "minimize_on_launch": False,
+    "remember_last_executable": True,
+    "ui_text_scale": 100,
+    "confirm_launch": False,
 }
 
 RES_PATTERN = re.compile(r"\d{3,5}x\d{3,5}")
-MANGOHUD_POSITIONS = (
-    "top-left", "top-center", "top-right",
-    "middle-left", "middle-center", "middle-right",
-    "bottom-left", "bottom-center", "bottom-right",
-)
-
-
 # ============================================================
 # LOGGING
 # ============================================================
@@ -149,21 +148,22 @@ def load_config():
     for key in ("audio_output", "audio_input", "launch_monitor"):
         if not isinstance(config[key], str):
             config[key] = ""
-    if config["mangohud_position"] not in MANGOHUD_POSITIONS:
-        config["mangohud_position"] = "top-left"
-    try:
-        config["mangohud_scale"] = max(
-            50, min(200, int(config["mangohud_scale"])))
-    except (ValueError, TypeError):
-        config["mangohud_scale"] = 100
     try:
         config["fps_limit"] = max(0, min(1000, int(config["fps_limit"])))
     except (ValueError, TypeError):
         config["fps_limit"] = 0
-    for key in ("use_gamemode", "use_mangohud", "enable_esync",
+    try:
+        config["ui_text_scale"] = int(config["ui_text_scale"])
+    except (ValueError, TypeError, OverflowError):
+        config["ui_text_scale"] = 100
+    if config["ui_text_scale"] not in (100, 115, 130, 150):
+        config["ui_text_scale"] = 100
+    for key in ("use_gamemode", "enable_esync",
                 "enable_fsync", "dxvk_hud", "virtual_desktop", "wine_debug",
                 "intercept_fullscreen_keys", "trap_cursor", "enable_nvapi",
-                "vkd3d_raytracing"):
+                "vkd3d_raytracing", "show_prerelease",
+                "minimize_on_launch", "remember_last_executable",
+                "confirm_launch"):
         config[key] = bool(config[key])
     return config
 
@@ -568,8 +568,22 @@ def gamemode_status():
     return True, "; ".join(details)
 
 
-def mangohud_status(config):
-    return mangohud_summary(config, selected_monitor(config))
+
+def bug_fix_check(config=None):
+    """Run a small set of sanity checks and return a list of issues found."""
+    issues = []
+    try:
+        report = describe_dependencies()
+        if report:
+            issues.append("Missing dependencies:\n" + report)
+    except Exception as exc:
+        issues.append(f"Dependency check failed: {exc}")
+
+    cfg = config if isinstance(config, dict) else load_config()
+
+    if not issues:
+        issues.append("No obvious issues found.")
+    return issues
 
 
 # ============================================================
@@ -657,7 +671,7 @@ def to_windows_path(unix_path):
 # WINE ENVIRONMENT / COMMAND
 # ============================================================
 
-def build_env(config, prefix, is_new_prefix, game_launch=False):
+def build_env(config, prefix, is_new_prefix, game_launch=False, executable=None):
     env = os.environ.copy()
     env["WINEPREFIX"] = str(prefix)
     env["WINEDEBUG"] = "warn+all" if config["wine_debug"] else "-all"
@@ -698,11 +712,6 @@ def build_env(config, prefix, is_new_prefix, game_launch=False):
     apply_translation_env(env, config, prefix,
                           nvidia=gpu_is_nvidia(config, env))
 
-    if game_launch and config["use_mangohud"]:
-        env.update(build_mangohud_env(config, selected_monitor(config)))
-    else:
-        env.pop("MANGOHUD", None)
-        env.pop("MANGOHUD_CONFIG", None)
     return env
 
 
@@ -712,10 +721,7 @@ def build_command(config, wine, executable, arguments):
         gm = find_tool("gamemoderun")
         if gm:
             cmd.append(gm)
-    if config["use_mangohud"]:
-        mh = resolve_mangohud()
-        if mh:
-            cmd.append(mh)
+
 
     cmd.append(wine)
 
@@ -729,6 +735,54 @@ def build_command(config, wine, executable, arguments):
 
     cmd += list(arguments)
     return cmd
+
+
+def start_application_shell():
+    """Ensure the detached hotkey shell is running.
+
+    A new process is spawned for every launch; it takes a singleton lock, so
+    redundant instances exit immediately.  The heartbeat is written even
+    when an existing shell owns the lock, which tells that shell a new Wine
+    program is about to appear.
+    """
+    try:
+        SHELL_HEARTBEAT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        SHELL_HEARTBEAT_FILE.write_text(
+            f"{time.time():.3f}\n", encoding="utf-8")
+    except OSError:
+        pass
+
+    env = os.environ.copy()
+    root = str(PROJECT_ROOT)
+    pythonpath = env.get("PYTHONPATH", "")
+    if root not in pythonpath.split(os.pathsep):
+        env["PYTHONPATH"] = (root + os.pathsep + pythonpath
+                             if pythonpath else root)
+    env["PYTHONUNBUFFERED"] = "1"
+    if env.get("DISPLAY"):
+        # Wine windows are X11 (also under XWayland); the shell needs XCB
+        # access for window discovery and key grabs.
+        env["QT_QPA_PLATFORM"] = "xcb"
+
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        if SHELL_LOG.exists() and SHELL_LOG.stat().st_size > 1_000_000:
+            SHELL_LOG.unlink()
+    except OSError:
+        pass
+
+    try:
+        with open(SHELL_LOG, "a", encoding="utf-8") as out:
+            subprocess.Popen(
+                [sys.executable, "-m", "Core.Runtime.application_shell"],
+                cwd=root, env=env, stdin=subprocess.DEVNULL,
+                stdout=out, stderr=subprocess.STDOUT,
+                start_new_session=True, close_fds=True)
+    except OSError:
+        log("Could not start the application shell:\n"
+            + traceback.format_exc())
+        return False
+    return True
 
 
 def start_wine(config, executable, arguments=None, prefix_override=None):
@@ -762,8 +816,6 @@ def start_wine(config, executable, arguments=None, prefix_override=None):
     gpu_vars = {k: env[k] for k in GPU_ENV_VARS if k in env}
     gpu_note = plan_gpu(config["gpu_choice"], config["gpu_driver"])[1]
     gamemode_ok, gamemode_note = gamemode_status()
-    mangohud_note = (mangohud_status(config) if config["use_mangohud"]
-                     else "disabled")
     audio_note = (f"output={config['audio_output'] or 'system default'}, "
                   f"input={config['audio_input'] or 'system default'}")
     nvidia = nvidia_info()
@@ -787,7 +839,6 @@ def start_wine(config, executable, arguments=None, prefix_override=None):
                   f"GPU env: {gpu_vars or 'none'}\n"
                   f"NVIDIA: {nvidia_note}\n"
                   f"GameMode: {gamemode_note if config['use_gamemode'] else 'disabled'}\n"
-                  f"MangoHud: {mangohud_note}\n"
                   f"Audio: {audio_note}\n"
                   f"Monitor: {monitor_note}\n"
                   f"Command: {shlex.join(cmd)}\n\n")
@@ -809,8 +860,12 @@ def start_wine(config, executable, arguments=None, prefix_override=None):
     log(f"Launched {executable}\nPrefix: {prefix}\nGPU: {gpu_note}\nGPU env: {gpu_vars or 'none'}\n"
         f"NVIDIA: {nvidia_note}\n"
         f"GameMode: {gamemode_note if config['use_gamemode'] else 'disabled'}\n"
-        f"MangoHud: {mangohud_note}\nAudio: {audio_note}\nMonitor: {monitor_note}\n"
+        f"Audio: {audio_note}\nMonitor: {monitor_note}\n"
         f"Command: {shlex.join(cmd)}")
+
+    # Hotkeys live in a detached shell, not in the launcher process, so
+    # closing WINE Citra does not disable them for this program.
+    start_application_shell()
     return proc, prefix, cmd
 
 
@@ -836,28 +891,27 @@ def launch_from_desktop(executable, arguments):
         log(f"Desktop launch failed: {e}")
         print(f"{APP_NAME}: {e}", file=sys.stderr)
         return 1
-    config["last_executable"] = str(Path(executable).expanduser().resolve())
+    config["last_executable"] = (
+        str(Path(executable).expanduser().resolve())
+        if config.get("remember_last_executable", True) else "")
     save_config(config)
 
-    # Keep this small process alive while the game runs, otherwise the
-    # interceptor would exit together with the launcher and F11 would go
-    # back to Wine's built-in fullscreen handling.
-    if (config.get("intercept_fullscreen_keys", True)
-            or config.get("trap_cursor", False)
-            or config.get("launch_monitor", "")) \
-            and start_fullscreen_hotkeys(config):
-        try:
-            _wait_for_wine_windows(process)
-        except KeyboardInterrupt:
-            pass
-        finally:
-            stop_fullscreen_hotkeys()
+    # start_wine already started the detached application shell.  This
+    # headless process can exit immediately; the shell stays alive and
+    # keeps hotkeys working for the program.
     return 0
 
 
 def install_desktop_entry():
     apps = HOME / ".local/share/applications"
     apps.mkdir(parents=True, exist_ok=True)
+    icon_dir = HOME / ".local/share/icons/hicolor/scalable/apps"
+    icon_dir.mkdir(parents=True, exist_ok=True)
+    icon_path = icon_dir / "wine-citra.svg"
+    if not APP_ICON_FILE.is_file():
+        raise FileNotFoundError(f"Application icon not found: {APP_ICON_FILE}")
+    shutil.copy2(APP_ICON_FILE, icon_path)
+
     entry = apps / "wine-citra.desktop"
     entry.write_text(
         "[Desktop Entry]\n"
@@ -866,12 +920,17 @@ def install_desktop_entry():
         "Comment=Run Windows programs with Wine\n"
         f"Exec={_desktop_exec()} %f\n"
         "Terminal=false\n"
+        "Icon=wine-citra\n"
         "Categories=Utility;\n"
         "MimeType=application/x-ms-dos-executable;application/x-msdownload;"
         "application/vnd.microsoft.portable-executable;\n",
         encoding="utf-8")
     if shutil.which("update-desktop-database"):
         subprocess.run(["update-desktop-database", str(apps)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    icon_theme = HOME / ".local/share/icons/hicolor"
+    if shutil.which("gtk-update-icon-cache"):
+        subprocess.run(["gtk-update-icon-cache", "-q", "-f", str(icon_theme)],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return entry
 
@@ -909,8 +968,19 @@ def _is_wine_process(pid):
         return False
 
     lowered = cmdline.lower()
-    return ("wine" in lowered
-            or "c:\\" in lowered or "z:\\" in lowered)
+    tokens = cmdline.split()
+    # A real Wine invocation either runs a wine binary directly or carries a
+    # Windows executable.  Merely having "wine" in a directory name (such as
+    # the WINE Citra install path) must not make a process look like Wine.
+    if any(os.path.basename(token).lower() in (
+            "wine", "wine64", "wineserver", "wine-preloader",
+            "winedevice.exe", "services.exe") for token in tokens):
+        return True
+    if ".exe" in lowered and "wine" in lowered:
+        return True
+    if "c:\\" in lowered or "z:\\" in lowered:
+        return True
+    return False
 
 
 class FullscreenKeyInterceptor:
@@ -923,6 +993,7 @@ class FullscreenKeyInterceptor:
     """
 
     POLL_INTERVAL = 0.5
+    GRAB_RETRY_INTERVAL = 2.0
 
     def __init__(self, config=None, poll_interval=POLL_INTERVAL):
         self.config = config if config is not None else {}
@@ -930,11 +1001,15 @@ class FullscreenKeyInterceptor:
         self._thread = None
         self._stop = threading.Event()
         self._grabbed = {}          # window id -> [(keycode, modifier mask)]
+        self._grab_retry = {}       # window id -> monotonic retry timestamp
         self._active_windows = set()
         self._atoms = {}
         self._pointer_window = None
         self._pointer_error_logged = False
         self._placed_windows = set()
+        self._last_fullscreen_toggle = 0.0
+        self._saved_geometry = {}
+        self._x_error_times = {}
 
     # --------------------------------------------------------
     # Lifecycle
@@ -960,6 +1035,27 @@ class FullscreenKeyInterceptor:
             thread.join(timeout=2.0)
         self._thread = None
 
+    def _on_x_error(self, error, _request=None):
+        data = getattr(error, "_data", {}) or {}
+        code = data.get("code")
+        resource = data.get("resource_id")
+        if hasattr(resource, "id"):
+            resource = resource.id
+        try:
+            resource = int(resource or 0)
+        except (TypeError, ValueError):
+            resource = 0
+        now = time.monotonic()
+        key = (code, resource)
+        if now - self._x_error_times.get(key, 0.0) < 60.0:
+            return
+        self._x_error_times[key] = now
+        if code == 10:      # BadAccess: another client owns the grab.
+            log(f"X11 key grab on window 0x{resource:x} is owned by another "
+                "client; retrying.")
+        else:
+            log(f"X11 protocol error {code} on resource 0x{resource:x}.")
+
     def _enabled(self):
         return bool(self.config.get("intercept_fullscreen_keys", True))
 
@@ -978,6 +1074,10 @@ class FullscreenKeyInterceptor:
             log(f"Fullscreen hotkeys unavailable (no X11 display): {exc}")
             return
 
+        # Failed key grabs are reported asynchronously by Xlib.  Keep them
+        # out of the shell's stderr and log each unique failure once a
+        # minute; a stale client may be holding the grab until it exits.
+        display.set_error_handler(self._on_x_error)
         self._atoms.clear()
         root = display.screen().root
         f11 = display.keysym_to_keycode(_XK.string_to_keysym("F11"))
@@ -997,6 +1097,7 @@ class FullscreenKeyInterceptor:
                 else:
                     self._sync_grabs(display, root, key_specs, modifiers,
                                      grab_keys=False)
+
                 self._update_pointer(display, root)
 
                 self._drain_events(display, root, f11, ret)
@@ -1105,20 +1206,16 @@ class FullscreenKeyInterceptor:
                     grab_keys=True):
         current = set()
         grabbed_any = False
-        if not grab_keys:
-            # Drop any key grabs left over from when interception was on.
-            self._release_grabs(display)
-        wine_windows = self._wine_windows(display, root)
 
-        for window, pid in wine_windows:
+        if not grab_keys:
+            self._release_grabs(display)
+
+        for window, pid in self._wine_windows(display, root):
             wid = window.id
             current.add(wid)
-            if wid in self._grabbed and (
-                    not grab_keys or self._grabbed[wid]):
-                continue
             if not grab_keys:
-                # Still track the window for cursor trapping and placement.
-                self._grabbed[wid] = []
+                continue
+            if wid in self._grabbed:
                 continue
 
             grabbed = []
@@ -1135,16 +1232,14 @@ class FullscreenKeyInterceptor:
                         log(f"Could not grab key {keycode} on window 0x{wid:x}: {exc}")
 
             self._grabbed[wid] = grabbed
-            log(f"Intercepting F11 and Ctrl+Enter on Wine window 0x{wid:x} (pid {pid}).")
+            log(f"Intercepting F11 and Ctrl+Enter on Wine window "
+                f"0x{wid:x} (pid {pid}).")
 
         self._active_windows = set(current)
 
         for wid in list(self._grabbed):
             if wid not in current:
                 self._release_window(display, wid)
-
-        self._placed_windows.intersection_update(current)
-        self._place_on_selected_monitor(display, wine_windows)
 
         if grabbed_any:
             display.flush()
@@ -1302,9 +1397,8 @@ class FullscreenKeyInterceptor:
             return
 
         # The window manager resizes the top-level Wine window, but Wine may
-        # keep its rendering child at the old work-area size. That leaves a
-        # strip of desktop/taskbar visible along the bottom edge. Give the WM
-        # a moment to settle, then make the main child fill the window again.
+        # keep its rendering child at the old work-area size. Give the WM a
+        # moment to settle, then make the main child fill the window again.
         self._fit_client_children(display, window)
 
         verb = "Disabled" if fullscreen else "Enabled"
@@ -1317,8 +1411,7 @@ class FullscreenKeyInterceptor:
         work area, which excludes the panel/taskbar. When the toplevel window
         is made fullscreen the child can stay a little shorter, leaving an
         uncovered strip at the bottom. Only resize children that already
-        occupy (almost) the whole window, so real overlay windows are left
-        alone.
+        occupy (almost) the whole window to avoid changing unrelated children.
         """
         for _ in range(attempts):
             time.sleep(interval)
@@ -1327,27 +1420,48 @@ class FullscreenKeyInterceptor:
                 children = window.query_tree().children
             except Exception:
                 return
-            resized = False
+            # Pick the largest child (the game's rendering surface) and force it
+            # to fill the top-level window, stretching if needed.
+            best = None
             for child in children:
                 try:
-                    child_geometry = child.get_geometry()
-                    if (child_geometry.width < geometry.width * 0.9
-                            or child_geometry.height < geometry.height * 0.9):
-                        continue
-                    if (child_geometry.width == geometry.width
-                            and child_geometry.height == geometry.height):
-                        continue
-                    child.configure(x=0, y=0,
-                                    width=geometry.width,
-                                    height=geometry.height)
-                    resized = True
+                    cg = child.get_geometry()
                 except Exception:
                     continue
-            if resized:
-                try:
-                    display.flush()
-                except Exception:
-                    return
+                if cg.width < 64 or cg.height < 64:
+                    continue
+                if best is None or cg.width * cg.height > best[1].width * best[1].height:
+                    best = (child, cg)
+            if best is None:
+                continue
+            child, cg = best
+            if cg.width == geometry.width and cg.height == geometry.height:
+                continue
+            try:
+                child.configure(x=0, y=0,
+                                width=geometry.width,
+                                height=geometry.height)
+                display.flush()
+            except Exception:
+                continue
+
+    def _fit_client_children_by_id(self, wid, attempts=15, interval=0.1):
+        """Background version of _fit_client_children (own X11 connection)."""
+        try:
+            display = _xdisplay.Display()
+        except Exception:
+            return
+        try:
+            window = display.create_resource_object("window", wid)
+        except Exception:
+            display.close()
+            return
+        self._fit_client_children(display, window, attempts=attempts,
+                                  interval=interval)
+        try:
+            display.close()
+        except Exception:
+            pass
 
 
 _fullscreen_hotkeys = None
@@ -1414,6 +1528,7 @@ def run(argv=None):
         return launch_from_desktop(argv[1], argv[2:])
 
     from PyQt6.QtWidgets import QApplication
+    from PyQt6.QtGui import QIcon
 
     from Core.CrashHandler.crash_service_runtime import install_exception_hook
     from UI.MainWindow.window import MainWindow
@@ -1421,7 +1536,30 @@ def run(argv=None):
     app = QApplication(argv)
     app.setApplicationName(APP_NAME)
     app.setApplicationVersion(APP_VERSION)
+    app.setDesktopFileName("wine-citra")
+    app.setWindowIcon(QIcon(str(APP_ICON_FILE)))
     app.setStyle("Fusion")
+
+    # Keep dialogs/prompts centered on the primary monitor instead of
+    # snapping to a corner of the (possibly small) parent window.
+    from PyQt6.QtCore import QEvent, QObject
+
+    class _CenterFilter(QObject):
+        def eventFilter(self, obj, event):
+            if event.type() == QEvent.Type.Show:
+                try:
+                    from PyQt6.QtWidgets import QDialog
+                    if isinstance(obj, QDialog):
+                        screen = app.primaryScreen()
+                        if screen is not None:
+                            geo = screen.availableGeometry()
+                            obj.move(geo.center() - obj.rect().center())
+                except Exception:
+                    pass
+            return False
+
+    _center_filter = _CenterFilter(app)
+    app.installEventFilter(_center_filter)
 
     install_exception_hook()
 
@@ -1432,12 +1570,12 @@ def run(argv=None):
     window = MainWindow()
     window.show()
 
-    # F11 toggles borderless fullscreen on Wine windows and Ctrl+Enter is
-    # swallowed while the configuration option is enabled.
-    start_fullscreen_hotkeys(window.config)
-    app.aboutToQuit.connect(stop_fullscreen_hotkeys)
-
+    start_application_shell()
     return app.exec()
+
+
+
+
 
 
 # Kept as a convenience alias for callers that prefer the old name.
