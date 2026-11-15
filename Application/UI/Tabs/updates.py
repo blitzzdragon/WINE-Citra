@@ -1,6 +1,7 @@
 """Browse WINE Citra releases and their release notes."""
 
 import json
+import re
 
 from datetime import datetime
 
@@ -15,6 +16,7 @@ from PyQt6.QtWidgets import (
 )
 
 from Core.Runtime.application_runtime import APP_VERSION, save_config
+from UI.theme import MUTED_TEXT_COLOR
 
 RELEASES_URL = "https://github.com/blitzzdragon/WINE-Citra/releases"
 API_URL = "https://api.github.com/repos/blitzzdragon/WINE-Citra/releases"
@@ -83,8 +85,15 @@ class UpdatesTab(QWidget):
         card_layout.addLayout(heading)
 
         self.release_date = QLabel("")
-        self.release_date.setStyleSheet("color: palette(mid);")
+        self.release_date.setStyleSheet(f"color: {MUTED_TEXT_COLOR};")
         card_layout.addWidget(self.release_date)
+
+        self.release_notice = QLabel()
+        self.release_notice.setWordWrap(True)
+        self.release_notice.setStyleSheet(
+            f"color: {MUTED_TEXT_COLOR}; font-weight: 600;")
+        self.release_notice.hide()
+        card_layout.addWidget(self.release_notice)
 
         self.notes = QTextBrowser()
         self.notes.setOpenExternalLinks(True)
@@ -93,7 +102,8 @@ class UpdatesTab(QWidget):
         self.notes.setAccessibleDescription(
             "Release details and changes for the selected version.")
         self.notes.setMinimumHeight(180)
-        self.notes.setMaximumHeight(300)
+        self.notes.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         card_layout.addWidget(self.notes, 1)
         layout.addWidget(self.card, 1)
 
@@ -200,6 +210,8 @@ class UpdatesTab(QWidget):
                 "version": version,
                 "tag": tag,
                 "type": "Beta" if prerelease else "Stable release",
+                "installed": self._is_installed_version(version, tag),
+                "older": self._is_older_version(version, tag),
                 "published": str(release.get("published_at") or "")[:10],
                 "body": str(release.get("body") or "").strip(),
                 "page_url": str(release.get("html_url") or RELEASES_URL),
@@ -213,10 +225,7 @@ class UpdatesTab(QWidget):
             label = release["version"]
             if release["type"] == "Beta" and "beta" not in label.lower():
                 label += " (Beta)"
-            installed = APP_VERSION.lstrip("v")
-            published_version = release["tag"].lstrip("v")
-            if (published_version == installed
-                    or release["version"].lstrip("v") == installed):
+            if release["installed"]:
                 label += " (Installed)"
             self.release_combo.addItem(label, release["tag"])
         self._releases = entries
@@ -242,8 +251,12 @@ class UpdatesTab(QWidget):
             self.release_title.setText("No version selected")
             self.release_type.clear()
             self.release_date.clear()
+            self.release_notice.clear()
+            self.release_notice.hide()
             self.notes.setPlainText(
                 "Check for updates to load available versions and release notes.")
+            self.btn_open.setVisible(True)
+            self.btn_download.setVisible(True)
             self.btn_open.setEnabled(False)
             self.btn_download.setEnabled(False)
             return
@@ -257,12 +270,61 @@ class UpdatesTab(QWidget):
             self.notes.setMarkdown(release["body"])
         else:
             self.notes.setPlainText("No release notes were provided.")
+        if release["installed"]:
+            self.release_notice.setText("Package already installed.")
+        elif release["older"]:
+            self.release_notice.setText("This is an older package.")
+        else:
+            self.release_notice.clear()
+        self.release_notice.setVisible(
+            release["installed"] or release["older"])
+        self.btn_open.setVisible(not release["installed"])
+        self.btn_download.setVisible(not release["installed"])
         self.btn_open.setEnabled(bool(release["page_url"]))
-        self.btn_download.setEnabled(bool(release["package_url"]))
-        self.btn_download.setToolTip(
-            "Download the Debian package for this version."
-            if release["package_url"]
-            else "No Debian package is attached to this release.")
+        can_install = bool(release["package_url"]) and not release["installed"]
+        self.btn_download.setEnabled(can_install)
+        if release["installed"]:
+            self.btn_download.setToolTip(
+                "This version is already installed.")
+        elif release["package_url"]:
+            self.btn_download.setToolTip(
+                "Download the Debian package for this version.")
+        else:
+            self.btn_download.setToolTip(
+                "No Debian package is attached to this release.")
+
+    @staticmethod
+    def _is_installed_version(version, tag):
+        installed = APP_VERSION.strip().lstrip("v").lower()
+        return any(
+            value.strip().lstrip("v").lower() == installed
+            for value in (version, tag)
+        )
+
+    @staticmethod
+    def _version_parts(value):
+        match = re.search(r"(?<![A-Za-z0-9])v?(\d+(?:\.\d+)+)",
+                          str(value), re.IGNORECASE)
+        return tuple(int(part) for part in match.group(1).split(".")) \
+            if match else None
+
+    @classmethod
+    def _is_older_version(cls, version, tag):
+        installed = cls._version_parts(APP_VERSION)
+        candidate = cls._version_parts(version) or cls._version_parts(tag)
+        if installed is None or candidate is None:
+            return False
+        width = max(len(installed), len(candidate))
+        installed += (0,) * (width - len(installed))
+        candidate += (0,) * (width - len(candidate))
+        if candidate != installed:
+            return candidate < installed
+        is_prerelease = re.search(
+            r"(?:alpha|beta|rc|pre-release)",
+            f"{version} {tag}", re.IGNORECASE)
+        installed_is_prerelease = re.search(
+            r"(?:alpha|beta|rc|pre-release)", APP_VERSION, re.IGNORECASE)
+        return bool(is_prerelease and not installed_is_prerelease)
 
     def open_release_page(self):
         index = self.release_combo.currentIndex()
@@ -274,6 +336,9 @@ class UpdatesTab(QWidget):
     def download_release(self):
         index = self.release_combo.currentIndex()
         if 0 <= index < len(self._releases):
-            url = self._releases[index]["package_url"]
+            release = self._releases[index]
+            if release["installed"]:
+                return
+            url = release["package_url"]
             if url:
                 QDesktopServices.openUrl(QUrl(url))

@@ -1,0 +1,49 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments and local build output
+.venv/
+venv/
+env/
+build/
+dist/
+*.egg-info/
+
+# Local environment, credentials, and session data
+.env
+.env.*
+!.env.example
+supabase*.json
+*credentials*.json
+*secrets*.json
+*_secret.*
+*_secrets.*
+*_credential.*
+*_credentials.*
+*_private_key.*
+*_private_keys.*
+*_access_token.*
+*_refresh_token.*
+secrets.*
+credentials.*
+private-key.*
+private_key.*
+*.secret
+*.secrets
+*.pem
+*.key
+*.p12
+*.pfx
+report-session.json
+secrets/
+credentials/
+private/
+local-scripts/
+
+# Logs and packages
+*.log
+*.deb

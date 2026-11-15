@@ -23,8 +23,8 @@ PACKAGER_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = PACKAGER_DIR.parent
 DEFAULT_CONFIG = PACKAGER_DIR / "Configuration" / "winecitra_config.json"
 
-DEFAULT_DEPENDS = "python3, python3-pyqt6, python3-xlib, wine"
-DEFAULT_RECOMMENDS = "winetricks, gamemode"
+DEFAULT_DEPENDS = "python3, python3-pyqt6, python3-xlib, wine, ffmpeg"
+DEFAULT_RECOMMENDS = "winetricks, gamemode, vkbasalt"
 DEFAULT_INCLUDE = ["main.py", "Core", "UI", "SettingsMemory", "Assets"]
 
 # Repository files that must never be copied into the installed package.
@@ -36,7 +36,15 @@ DEFAULT_EXCLUDE = [
 
 DEFAULT_IGNORE_PATTERNS = [
     "__pycache__", "*.pyc", "*.pyo", ".git", ".gitignore",
-    ".DS_Store", "*~", "*.deb",
+    ".DS_Store", "*~", "*.deb", ".env", ".env.*",
+    "supabase*.json", "*credentials*.json", "*secrets*.json",
+    "*_secret.*", "*_secrets.*", "*_credential.*", "*_credentials.*",
+    "*_private_key.*", "*_private_keys.*", "*_access_token.*",
+    "*_refresh_token.*", "secrets.*", "credentials.*",
+    "private-key.*", "private_key.*",
+    "*.secret", "*.secrets", "*.pem", "*.key", "*.p12", "*.pfx",
+    "report-session.json", "secrets", "credentials", "private",
+    "local-scripts",
 ]
 
 

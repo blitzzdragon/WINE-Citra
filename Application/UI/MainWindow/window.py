@@ -25,17 +25,23 @@ from Core.Runtime.application_runtime import (
     APP_ICON_FILE, APP_NAME, APP_VERSION, LOG_DIR, PREFIX_BASE, PROJECT_ROOT,
     apply_gpu_env, build_env, get_prefix_arch, is_inside_prefix_base,
     list_prefixes, load_config, log, prefix_exists, resolve_wine, safe_name,
+    take_launcher_tab_request,
 )
+from UI.Audio.sounds import play_sound
 from UI.Tabs.logs import LogsTab
 from UI.Tabs.overview import LauncherTab
+from UI.Tabs.clips import ClipsTab
+from UI.Tabs.screenshots import ScreenshotsTab
 from UI.Tabs.settings import SettingsTab
 from UI.Tabs.updates import UpdatesTab
+from UI.Tabs.reports import ReportsTab
 from UI.Toolbar.toolbar import StatusToolbar
 
 
 def open_path(parent, path):
     path = Path(path)
     if not path.exists():
+        play_sound("error", getattr(parent, "config", None))
         QMessageBox.warning(parent, APP_NAME, f"Path does not exist:\n{path}")
         return
     QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
@@ -455,6 +461,12 @@ class MainWindow(QWidget):
             "QTabBar::tab:selected { font-weight: 600; }"
             "QPushButton, QToolButton { min-height: 29px; padding: 4px 9px; }"
             "QLineEdit, QComboBox, QSpinBox { min-height: 27px; padding: 3px; }"
+            "QLineEdit::clear-button { subcontrol-origin: padding; "
+            "subcontrol-position: right center; margin: 0 4px 0 0; "
+            "min-width: 18px; max-width: 18px; min-height: 18px; "
+            "max-height: 18px; padding: 0; }"
+            "QLineEdit QToolButton { min-width: 18px; max-width: 18px; "
+            "min-height: 18px; max-height: 18px; padding: 0; margin: 0; }"
             "QPushButton:hover, QToolButton:hover { "
             "border-color: palette(highlight); }"
             "QPushButton:focus, QToolButton:focus, QLineEdit:focus, "
@@ -472,11 +484,17 @@ class MainWindow(QWidget):
         self.prefixes_tab = PrefixesTab(self)
         self.logs_tab = LogsTab(self)
         self.updates_tab = UpdatesTab(self)
+        self.screenshots_tab = ScreenshotsTab(self)
+        self.clips_tab = ClipsTab(self)
+        self.reports_tab = ReportsTab(self)
         self.tabs.addTab(self.launcher_tab, "Launcher")
         self.tabs.addTab(self.settings_tab, "Settings")
         self.tabs.addTab(self.prefixes_tab, "Prefixes")
         self.tabs.addTab(self.logs_tab, "Logs")
         self.tabs.addTab(self.updates_tab, "Updates")
+        self.tabs.addTab(self.screenshots_tab, "Screenshots")
+        self.tabs.addTab(self.clips_tab, "Clips")
+        self.tabs.addTab(self.reports_tab, "Report")
         layout.addWidget(self.tabs)
 
         self._selection = load_selection()
@@ -486,6 +504,13 @@ class MainWindow(QWidget):
             self.tabs.setCurrentIndex(0)
         self.tabs.currentChanged.connect(self.remember_tab)
         self.tabs.tabBarClicked.connect(self._tab_bar_clicked)
+
+        self._launcher_tab_request_timer = QTimer(self)
+        self._launcher_tab_request_timer.setInterval(150)
+        self._launcher_tab_request_timer.timeout.connect(
+            self._apply_launcher_tab_request)
+        self._launcher_tab_request_timer.start()
+        self._apply_launcher_tab_request()
 
         self._refresh_shortcut = QShortcut(QKeySequence("F5"), self)
         self._refresh_shortcut.activated.connect(self.refresh_all)
@@ -506,6 +531,8 @@ class MainWindow(QWidget):
     # --------------------------------------------------------
 
     def message(self, title, text, icon=QMessageBox.Icon.Information):
+        if icon in (QMessageBox.Icon.Warning, QMessageBox.Icon.Critical):
+            play_sound("error", self.config)
         box = QMessageBox(self)
         box.setWindowTitle(f"{APP_NAME} - {title}")
         box.setIcon(icon)
@@ -531,15 +558,27 @@ class MainWindow(QWidget):
     def on_settings_saved(self):
         self.apply_accessibility_scale()
         self.launcher_tab.update_exe_info()
+        self.screenshots_tab.refresh_gallery()
 
     def remember_tab(self, index):
         self._selection["tab"] = index
         save_selection(self._selection)
 
+    def _apply_launcher_tab_request(self):
+        requested = take_launcher_tab_request()
+        tab = {
+            "screenshots": self.screenshots_tab,
+            "clips": self.clips_tab,
+        }.get(requested)
+        if tab is not None:
+            self.tabs.setCurrentWidget(tab)
+
     def _tab_bar_clicked(self, index):
         # Also refresh when the already-active Updates tab is clicked again.
         if self.tabs.widget(index) is self.updates_tab:
             self.updates_tab.check_updates()
+        elif self.tabs.widget(index) is self.screenshots_tab:
+            self.screenshots_tab.refresh_gallery()
 
     # --------------------------------------------------------
     # Refresh
@@ -553,6 +592,7 @@ class MainWindow(QWidget):
         self.refresh_prefixes()
         self.logs_tab.refresh_logs()
         self.launcher_tab.refresh_running()
+        self.screenshots_tab.refresh_gallery()
 
     def closeEvent(self, event):
         worker = self.prefixes_tab.worker
@@ -566,6 +606,7 @@ class MainWindow(QWidget):
             worker.wait(5000)
         # Flush any settings change that is still inside the autosave delay.
         self.settings_tab.flush_autosave()
+        self.reports_tab.wait_for_idle()
         # Wine programs and their detached application shell keep running
         # after this window is closed.
         event.accept()

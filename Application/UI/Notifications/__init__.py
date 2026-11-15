@@ -1,0 +1,1 @@
+"""Transient desktop notifications."""

@@ -5,38 +5,55 @@ import sys
 from pathlib import Path
 
 from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QPalette
 from PyQt6.QtWidgets import (
     QDialog, QHBoxLayout, QLabel, QPushButton, QTextEdit, QVBoxLayout,
 )
 
 from Core.Runtime.application_runtime import APP_NAME, GLOBAL_LOG
+from UI.theme import MUTED_TEXT_COLOR
 
 
 class CrashDialog(QDialog):
     def __init__(self, log_path=GLOBAL_LOG, exc_type=None, exc_value=None,
-                 traceback_text=""):
+                 traceback_text="", *, report_title=None, heading_text=None,
+                 info_text=None, error_text=None, close_text="Close and exit",
+                 quit_on_close=True):
         super().__init__(None)
-        self.setWindowTitle(f"{APP_NAME} - Crash Report")
+        self.report_title = report_title or f"{APP_NAME} crash report"
+        self.quit_on_close = quit_on_close
+        self.setWindowTitle(report_title or f"{APP_NAME} - Crash Report")
         self.setFixedSize(720, 520)
         self.traceback_text = traceback_text or ""
         self.log_path = log_path
         self.setWindowModality(Qt.WindowModality.ApplicationModal)
 
         layout = QVBoxLayout(self)
+        palette = self.palette()
+        error_color = "#ff3333"
+        text_color = palette.color(QPalette.ColorRole.Text).name()
+        muted_color = MUTED_TEXT_COLOR
+        base_color = palette.color(QPalette.ColorRole.Base).name()
+        border_color = palette.color(QPalette.ColorRole.Mid).name()
 
-        title = QLabel("WINE Citra encountered an unexpected error.")
-        title.setStyleSheet("font-size: 16px; font-weight: bold; color: #c0392b;")
+        title = QLabel(
+            heading_text or "WINE Citra encountered an unexpected error.")
+        title.setStyleSheet(
+            f"font-size: 16px; font-weight: bold; color: {error_color};")
         layout.addWidget(title)
 
-        code = getattr(exc_type, "__name__", "UnknownError")
-        if exc_value is not None:
+        code = error_text or getattr(exc_type, "__name__", "UnknownError")
+        if error_text is None and exc_value is not None:
             code = f"{code}: {exc_value}"
         error_label = QLabel(f"Error code: {code}")
-        error_label.setStyleSheet("font-family: monospace; color: #333;")
+        error_label.setStyleSheet(
+            f"font-family: monospace; color: {text_color};")
         error_label.setWordWrap(True)
         layout.addWidget(error_label)
 
-        info = QLabel("A traceback was saved. The most recent log lines are shown below:")
+        info = QLabel(
+            info_text or
+            "A traceback was saved. The most recent log lines are shown below:")
         info.setWordWrap(True)
         layout.addWidget(info)
 
@@ -45,7 +62,8 @@ class CrashDialog(QDialog):
         if hint:
             hint_label = QLabel(hint)
             hint_label.setWordWrap(True)
-            hint_label.setStyleSheet("color: #555; font-style: italic;")
+            hint_label.setStyleSheet(
+                f"color: {muted_color}; font-style: italic;")
             layout.addWidget(hint_label)
 
         tail = self._tail_log(log_path, lines=60)
@@ -56,8 +74,8 @@ class CrashDialog(QDialog):
         summary_label.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse)
         summary_label.setStyleSheet(
-            "background: #f6f6f6; color: #222; padding: 8px; "
-            "border: 1px solid #ddd; border-radius: 4px;")
+            f"background: {base_color}; color: {text_color}; padding: 8px; "
+            f"border: 1px solid {border_color}; border-radius: 4px;")
         layout.addWidget(summary_label)
 
         self.log_view = QTextEdit()
@@ -87,7 +105,7 @@ class CrashDialog(QDialog):
         btns.addWidget(open_btn)
         btns.addWidget(toggle)
         btns.addStretch()
-        close_btn = QPushButton("Close and exit")
+        close_btn = QPushButton(close_text)
         close_btn.clicked.connect(self.accept)
         btns.addWidget(close_btn)
         layout.addLayout(btns)
@@ -158,7 +176,7 @@ class CrashDialog(QDialog):
     def _copy_report(self):
         from PyQt6.QtWidgets import QApplication
         report = (
-            f"{APP_NAME} crash report\n"
+            f"{self.report_title}\n"
             f"Error: {self.traceback_text}\n\n"
             f"Log tail:\n{self.log_view.toPlainText()}\n"
         )
@@ -184,8 +202,9 @@ class CrashDialog(QDialog):
 
     def accept(self):
         super().accept()
-        from PyQt6.QtWidgets import QApplication
-        QApplication.quit()
+        if self.quit_on_close:
+            from PyQt6.QtWidgets import QApplication
+            QApplication.quit()
 
 
 def show_crash_dialog(log_path=GLOBAL_LOG, exc_type=None, exc_value=None,
@@ -198,3 +217,32 @@ def show_crash_dialog(log_path=GLOBAL_LOG, exc_type=None, exc_value=None,
     dialog = CrashDialog(log_path, exc_type, exc_value, traceback_text)
     dialog.exec()
     app.quit()
+
+
+def show_game_crash_dialog(application_name, exit_code, log_path):
+    """Show diagnostics for a Wine program without closing WINE Citra."""
+    import signal
+
+    if exit_code < 0:
+        try:
+            reason = f"terminated by {signal.Signals(-exit_code).name}"
+        except ValueError:
+            reason = f"terminated by signal {-exit_code}"
+    else:
+        reason = f"exited with code {exit_code}"
+    detail = (
+        f"{application_name} {reason}.\n"
+        "The program may have crashed. Review its Wine log for details.")
+    dialog = CrashDialog(
+        log_path=log_path,
+        exc_type=RuntimeError,
+        exc_value=detail,
+        traceback_text=detail,
+        report_title=f"{application_name} crash report",
+        heading_text=f"{application_name} ended unexpectedly.",
+        info_text="The latest Wine output is shown below.",
+        error_text=reason,
+        close_text="Close",
+        quit_on_close=False,
+    )
+    dialog.exec()

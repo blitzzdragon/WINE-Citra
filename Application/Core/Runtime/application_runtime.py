@@ -12,6 +12,7 @@ import os
 import re
 import select
 import shlex
+import signal
 import shutil
 import subprocess
 import sys
@@ -45,7 +46,7 @@ except Exception:       # pragma: no cover - depends on the host system
 # ============================================================
 
 APP_NAME = "WINE Citra"
-APP_VERSION = "0.3.66"
+APP_VERSION = "0.4.0"
 
 HOME = Path.home()
 DATA_DIR = HOME / ".local/share/wine-citra"
@@ -61,6 +62,8 @@ SHARED_PREFIX = PREFIX_BASE / "default"
 SHELL_LOCK_FILE = DATA_DIR / "application-shell.lock"
 SHELL_HEARTBEAT_FILE = DATA_DIR / "application-shell.heartbeat"
 SHELL_LOG = LOG_DIR / "application-shell.log"
+LAUNCHER_LOCK_FILE = DATA_DIR / "launcher.lock"
+LAUNCHER_TAB_REQUEST_FILE = DATA_DIR / "launcher-tab-request.json"
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 APP_ICON_FILE = PROJECT_ROOT / "Assets" / "windows_icon.svg"
@@ -95,9 +98,29 @@ DEFAULT_CONFIG = {
     "remember_last_executable": True,
     "ui_text_scale": 100,
     "confirm_launch": False,
+    "screenshots_enabled": True,
+    "screenshot_position": "bottom-right",
+    "screenshot_duration": 3,
+    "screenshot_directory": str(DATA_DIR / "screenshots"),
+    "clips_enabled": True,
+    "clip_duration": 30,
+    "clip_audio_enabled": True,
+    "clip_animated_preview_enabled": True,
+    "clip_directory": str(DATA_DIR / "clips"),
+    "launcher_hotkey_enabled": True,
+    "screenshot_notification_width": 360,
+    "screenshot_notification_height": 240,
+    "screenshot_animation_duration": 600,
+    "screenshot_notification_sounds": True,
+    "screenshot_notification_volume": 50,
+    "error_sounds_enabled": True,
+    "error_sound_volume": 70,
+    "vkbasalt_effect": "off",
 }
 
 RES_PATTERN = re.compile(r"\d{3,5}x\d{3,5}")
+SCREENSHOT_POSITIONS = ("top-left", "top-right", "bottom-left", "bottom-right")
+VKBASALT_EFFECTS = ("off", "fxaa", "smaa", "cas", "smaa:cas")
 # ============================================================
 # LOGGING
 # ============================================================
@@ -158,13 +181,50 @@ def load_config():
         config["ui_text_scale"] = 100
     if config["ui_text_scale"] not in (100, 115, 130, 150):
         config["ui_text_scale"] = 100
+    if config["screenshot_position"] not in SCREENSHOT_POSITIONS:
+        config["screenshot_position"] = "bottom-right"
+    try:
+        config["screenshot_duration"] = max(
+            1, min(10, int(config["screenshot_duration"])))
+    except (ValueError, TypeError, OverflowError):
+        config["screenshot_duration"] = 3
+    for key, default, minimum, maximum in (
+            ("screenshot_notification_width", 360, 260, 900),
+            ("screenshot_notification_height", 240, 160, 700),
+            ("screenshot_animation_duration", 600, 450, 1500),
+            ("screenshot_notification_volume", 50, 0, 100),
+            ("error_sound_volume", 70, 0, 100)):
+        try:
+            config[key] = max(minimum, min(maximum, int(config[key])))
+        except (ValueError, TypeError, OverflowError):
+            config[key] = default
+    if not isinstance(config["screenshot_directory"], str):
+        config["screenshot_directory"] = str(DATA_DIR / "screenshots")
+    if not isinstance(config["clip_directory"], str):
+        config["clip_directory"] = str(DATA_DIR / "clips")
+    try:
+        config["clip_duration"] = max(
+            5, min(300, int(config["clip_duration"])))
+    except (ValueError, TypeError, OverflowError):
+        config["clip_duration"] = 30
+    if config["vkbasalt_effect"] not in VKBASALT_EFFECTS:
+        config["vkbasalt_effect"] = "off"
     for key in ("use_gamemode", "enable_esync",
                 "enable_fsync", "dxvk_hud", "virtual_desktop", "wine_debug",
                 "intercept_fullscreen_keys", "trap_cursor", "enable_nvapi",
                 "vkd3d_raytracing", "show_prerelease",
                 "minimize_on_launch", "remember_last_executable",
-                "confirm_launch"):
+                "confirm_launch", "screenshots_enabled"):
         config[key] = bool(config[key])
+    config["clips_enabled"] = bool(config["clips_enabled"])
+    config["clip_audio_enabled"] = bool(config["clip_audio_enabled"])
+    config["clip_animated_preview_enabled"] = bool(
+        config["clip_animated_preview_enabled"])
+    config["launcher_hotkey_enabled"] = bool(
+        config["launcher_hotkey_enabled"])
+    config["screenshot_notification_sounds"] = bool(
+        config["screenshot_notification_sounds"])
+    config["error_sounds_enabled"] = bool(config["error_sounds_enabled"])
     return config
 
 
@@ -698,6 +758,26 @@ def build_env(config, prefix, is_new_prefix, game_launch=False, executable=None)
     else:
         env.pop("DXVK_FRAME_RATE", None)
 
+    effect = config.get("vkbasalt_effect", "off")
+    if effect not in VKBASALT_EFFECTS:
+        raise RuntimeError(f"Unsupported vkBasalt effect: {effect}")
+    if game_launch and effect != "off":
+        vkbasalt_config = CONFIG_DIR / "vkBasalt.conf"
+        try:
+            vkbasalt_config.write_text(
+                f"effects = {effect}\n"
+                "toggleKey = Home\n"
+                "enableOnLaunch = True\n",
+                encoding="utf-8")
+        except OSError as error:
+            raise RuntimeError(
+                f"Could not write vkBasalt settings:\n{error}") from error
+        env["ENABLE_VKBASALT"] = "1"
+        env["VKBASALT_CONFIG_FILE"] = str(vkbasalt_config)
+    else:
+        env.pop("ENABLE_VKBASALT", None)
+        env.pop("VKBASALT_CONFIG_FILE", None)
+
     # Audio: an empty selection means "use the system default", so the
     # variables are removed rather than set to an empty string.
     for key, selection in (("PULSE_SINK", config["audio_output"]),
@@ -752,6 +832,8 @@ def start_application_shell():
     except OSError:
         pass
 
+    _restart_stale_application_shell()
+
     env = os.environ.copy()
     root = str(PROJECT_ROOT)
     pythonpath = env.get("PYTHONPATH", "")
@@ -783,6 +865,52 @@ def start_application_shell():
             + traceback.format_exc())
         return False
     return True
+
+
+def _restart_stale_application_shell():
+    """Replace a shell whose loaded source predates the on-disk application."""
+    try:
+        lock_lines = SHELL_LOCK_FILE.read_text(encoding="utf-8").splitlines()
+        pid = int(lock_lines[0])
+        started_at = float(lock_lines[1])
+        process_dir = Path(f"/proc/{pid}")
+        if process_dir.stat().st_uid != os.getuid():
+            return
+        command = [part for part in
+                   (process_dir / "cmdline").read_bytes().split(b"\0") if part]
+        if not any(b"Core.Runtime.application_shell" in part
+                   for part in command):
+            return
+        process_cwd = Path(os.readlink(process_dir / "cwd"))
+        shell_source = process_cwd / "Core/Runtime/application_shell.py"
+        if (not shell_source.is_file()
+                or shell_source.stat().st_mtime <= started_at + 0.5):
+            return
+    except (OSError, ValueError, IndexError):
+        return
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except OSError as error:
+        log(f"Could not restart stale application shell {pid}: {error}")
+        return
+
+    deadline = time.monotonic() + 4.0
+    while time.monotonic() < deadline:
+        try:
+            current_pid = int(SHELL_LOCK_FILE.read_text(
+                encoding="utf-8").splitlines()[0])
+        except (OSError, ValueError, IndexError):
+            current_pid = 0
+        if current_pid != pid or not Path(f"/proc/{pid}").exists():
+            log(f"Stopped stale application shell {pid}; the updated shell "
+                "will take over.")
+            return
+        time.sleep(0.1)
+    log(f"Stale application shell {pid} did not stop in time; "
+        "hotkey behavior may remain outdated.")
 
 
 def start_wine(config, executable, arguments=None, prefix_override=None):
@@ -983,6 +1111,96 @@ def _is_wine_process(pid):
     return False
 
 
+def _process_tree(root_pid):
+    """Return *root_pid* and its currently running descendants."""
+    children = {}
+    try:
+        entries = os.scandir("/proc")
+    except OSError:
+        return {root_pid}
+
+    with entries:
+        for entry in entries:
+            if not entry.name.isdigit():
+                continue
+            try:
+                stat = Path(entry.path, "stat").read_text(encoding="utf-8")
+                fields = stat[stat.rfind(")") + 2:].split()
+                parent_pid = int(fields[1])
+                children.setdefault(parent_pid, []).append(int(entry.name))
+            except (OSError, ValueError, IndexError):
+                continue
+
+    result = {root_pid}
+    pending = [root_pid]
+    while pending:
+        for child_pid in children.get(pending.pop(), ()):
+            if child_pid not in result:
+                result.add(child_pid)
+                pending.append(child_pid)
+    return result
+
+
+def focus_wine_process(root_pid):
+    """Ask the window manager to focus the normal X11 window for a launch."""
+    if not _XLIB_AVAILABLE:
+        return False
+
+    display = None
+    try:
+        display = _xdisplay.Display()
+        root = display.screen().root
+        client_list_atom = display.intern_atom("_NET_CLIENT_LIST")
+        pid_atom = display.intern_atom("_NET_WM_PID")
+        type_atom = display.intern_atom("_NET_WM_WINDOW_TYPE")
+        normal_atom = display.intern_atom("_NET_WM_WINDOW_TYPE_NORMAL")
+        active_atom = display.intern_atom("_NET_ACTIVE_WINDOW")
+        prop = root.get_full_property(client_list_atom, _X.AnyPropertyType)
+        if not prop or not prop.value:
+            return False
+
+        process_pids = _process_tree(int(root_pid))
+        for window_id in prop.value:
+            window = display.create_resource_object("window", int(window_id))
+            try:
+                window_pid = window.get_full_property(
+                    pid_atom, _X.AnyPropertyType)
+                window_type = window.get_full_property(
+                    type_atom, _X.AnyPropertyType)
+            except Exception:
+                continue
+            if not window_pid or not window_pid.value:
+                continue
+            if int(window_pid.value[0]) not in process_pids:
+                continue
+            if (window_type and window_type.value
+                    and normal_atom not in window_type.value):
+                continue
+
+            message = _xprotocol.event.ClientMessage(
+                window=window,
+                client_type=active_atom,
+                data=(32, [2, _X.CurrentTime, 0, 0, 0]),
+            )
+            root.send_event(
+                message,
+                event_mask=(_X.SubstructureRedirectMask
+                            | _X.SubstructureNotifyMask))
+            display.flush()
+            return True
+        return False
+    except Exception:
+        log("Could not focus the running Wine application:\n"
+            + traceback.format_exc())
+        return False
+    finally:
+        if display is not None:
+            try:
+                display.close()
+            except Exception:
+                pass
+
+
 class FullscreenKeyInterceptor:
     """Grab F11 and Ctrl+Enter on Wine windows and manage window helpers.
 
@@ -1001,13 +1219,26 @@ class FullscreenKeyInterceptor:
         self._thread = None
         self._stop = threading.Event()
         self._grabbed = {}          # window id -> [(keycode, modifier mask)]
+        self._grabbed_specs = {}
         self._grab_retry = {}       # window id -> monotonic retry timestamp
+        self._failed_key_grabs = set()
         self._active_windows = set()
+        self._wine_window_order = []
+        self._wine_window_geometries = {}
         self._atoms = {}
         self._pointer_window = None
         self._pointer_error_logged = False
         self._placed_windows = set()
         self._last_fullscreen_toggle = 0.0
+        self._last_screenshot_request = 0.0
+        self._screenshot_request = None
+        self._screenshot_lock = threading.Lock()
+        self._clip_request = None
+        self._clip_lock = threading.Lock()
+        self._last_clip_request = 0.0
+        self._launcher_request = False
+        self._launcher_lock = threading.Lock()
+        self._last_launcher_request = 0.0
         self._saved_geometry = {}
         self._x_error_times = {}
 
@@ -1045,6 +1276,8 @@ class FullscreenKeyInterceptor:
             resource = int(resource or 0)
         except (TypeError, ValueError):
             resource = 0
+        if code == 10:
+            self._failed_key_grabs.add(resource)
         now = time.monotonic()
         key = (code, resource)
         if now - self._x_error_times.get(key, 0.0) < 60.0:
@@ -1052,16 +1285,57 @@ class FullscreenKeyInterceptor:
         self._x_error_times[key] = now
         if code == 10:      # BadAccess: another client owns the grab.
             log(f"X11 key grab on window 0x{resource:x} is owned by another "
-                "client; retrying.")
+                f"client; will retry after {self.GRAB_RETRY_INTERVAL:g}s.")
         else:
             log(f"X11 protocol error {code} on resource 0x{resource:x}.")
 
-    def _enabled(self):
+    def _fullscreen_keys_enabled(self):
         return bool(self.config.get("intercept_fullscreen_keys", True))
+
+    def _key_specs(self, f11, ret, f12, f8=None):
+        specs = []
+        if self._fullscreen_keys_enabled():
+            if f11:
+                specs.append((f11, 0))
+            if ret:
+                specs.append((ret, _X.ControlMask))
+        if self.config.get("screenshots_enabled", True) and f12:
+            specs.append((f12, 0))
+        if self.config.get("clips_enabled", True) and f12:
+            specs.append((f12, _X.ControlMask))
+        if self.config.get("launcher_hotkey_enabled", True) and f8:
+            specs.append((f8, 0))
+        return tuple(specs)
 
     def has_wine_windows(self):
         """Return True while at least one Wine window is visible."""
         return bool(self._active_windows)
+
+    def take_screenshot_request(self):
+        with self._screenshot_lock:
+            request = self._screenshot_request
+            self._screenshot_request = None
+        return request
+
+    def take_clip_request(self):
+        with self._clip_lock:
+            request = self._clip_request
+            self._clip_request = None
+        return request
+
+    def take_launcher_request(self):
+        with self._launcher_lock:
+            requested = self._launcher_request
+            self._launcher_request = False
+        return requested
+
+    def primary_wine_window(self):
+        return self._wine_window_order[0] if self._wine_window_order else None
+
+    def primary_wine_window_geometry(self):
+        window_id = self.primary_wine_window()
+        return (self._wine_window_geometries.get(window_id)
+                if window_id is not None else None)
 
     # --------------------------------------------------------
     # Worker
@@ -1082,29 +1356,34 @@ class FullscreenKeyInterceptor:
         root = display.screen().root
         f11 = display.keysym_to_keycode(_XK.string_to_keysym("F11"))
         ret = display.keysym_to_keycode(_XK.string_to_keysym("Return"))
-        if not f11 or not ret:
-            log("Fullscreen hotkeys disabled: F11/Return keycodes could not be resolved.")
+        f12 = display.keysym_to_keycode(_XK.string_to_keysym("F12"))
+        f8 = display.keysym_to_keycode(_XK.string_to_keysym("F8"))
+        if self._fullscreen_keys_enabled() and (not f11 or not ret):
+            log("Some fullscreen hotkeys are unavailable: F11/Return "
+                "keycodes could not be resolved.")
+        if ((self.config.get("clips_enabled", True)
+             or self.config.get("screenshots_enabled", True)) and not f12):
+            log("Screenshot/clip hotkeys unavailable: F12 keycode could not be resolved.")
+        if self.config.get("launcher_hotkey_enabled", True) and not f8:
+            log("Launcher hotkey unavailable: F8 keycode could not be resolved.")
+        if not f11 and not ret and not f12 and not f8:
             display.close()
             return
 
-        key_specs = ((f11, 0), (ret, _X.ControlMask))
         modifiers = (0, _X.LockMask, _X.Mod2Mask, _X.LockMask | _X.Mod2Mask)
 
         try:
             while not self._stop.is_set():
-                if self._enabled():
-                    self._sync_grabs(display, root, key_specs, modifiers)
-                else:
-                    self._sync_grabs(display, root, key_specs, modifiers,
-                                     grab_keys=False)
+                key_specs = self._key_specs(f11, ret, f12, f8)
+                self._sync_grabs(display, root, key_specs, modifiers)
 
                 self._update_pointer(display, root)
 
-                self._drain_events(display, root, f11, ret)
+                self._drain_events(display, root, f11, ret, f12, f8)
                 readable, _, _ = select.select(
                     [display.fileno()], [], [], self.poll_interval)
                 if readable:
-                    self._drain_events(display, root, f11, ret)
+                    self._drain_events(display, root, f11, ret, f12, f8)
         except Exception:
             log("Fullscreen hotkey thread stopped:\n" + traceback.format_exc())
         finally:
@@ -1122,11 +1401,11 @@ class FullscreenKeyInterceptor:
                 pass
             self._thread = None
 
-    def _drain_events(self, display, root, f11, ret):
+    def _drain_events(self, display, root, f11, ret, f12, f8):
         while display.pending_events():
             event = display.next_event()
             if event.type == _X.KeyPress:
-                self._handle_key(display, root, event, f11, ret)
+                self._handle_key(display, root, event, f11, ret, f12, f8)
 
     # --------------------------------------------------------
     # Window discovery / grabs
@@ -1205,19 +1484,39 @@ class FullscreenKeyInterceptor:
     def _sync_grabs(self, display, root, key_specs, modifiers,
                     grab_keys=True):
         current = set()
+        current_order = []
+        current_geometries = {}
         grabbed_any = False
+        now = time.monotonic()
 
-        if not grab_keys:
+        if not grab_keys or not key_specs:
             self._release_grabs(display)
 
         for window, pid in self._wine_windows(display, root):
             wid = window.id
             current.add(wid)
-            if not grab_keys:
+            current_order.append(wid)
+            try:
+                geometry = window.get_geometry()
+                position = root.translate_coords(window, 0, 0)
+                width, height = int(geometry.width), int(geometry.height)
+                if width >= 2 and height >= 2:
+                    current_geometries[wid] = (
+                        int(position.x), int(position.y), width, height)
+            except Exception:
+                pass
+            if not grab_keys or not key_specs:
                 continue
+            if (wid in self._grabbed
+                    and self._grabbed_specs.get(wid) == key_specs):
+                retry_at = self._grab_retry.get(wid, 0.0)
+                if not retry_at or now < retry_at:
+                    continue
+                self._release_window(display, wid)
             if wid in self._grabbed:
-                continue
+                self._release_window(display, wid)
 
+            self._failed_key_grabs.discard(wid)
             grabbed = []
             for keycode, base_mask in key_specs:
                 for extra in modifiers:
@@ -1229,13 +1528,29 @@ class FullscreenKeyInterceptor:
                         grabbed.append((keycode, mask))
                         grabbed_any = True
                     except Exception as exc:
+                        self._failed_key_grabs.add(wid)
                         log(f"Could not grab key {keycode} on window 0x{wid:x}: {exc}")
 
+            try:
+                display.sync()
+            except Exception:
+                log("Could not confirm X11 key grabs:\n"
+                    + traceback.format_exc())
+            if wid in self._failed_key_grabs:
+                self._grab_retry[wid] = time.monotonic() + self.GRAB_RETRY_INTERVAL
+                log(f"Some hotkeys could not be grabbed on Wine window "
+                    f"0x{wid:x}; retrying.")
+            else:
+                self._grab_retry.pop(wid, None)
             self._grabbed[wid] = grabbed
-            log(f"Intercepting F11 and Ctrl+Enter on Wine window "
-                f"0x{wid:x} (pid {pid}).")
+            self._grabbed_specs[wid] = key_specs
+            if not self._grab_retry.get(wid):
+                log(f"Intercepting configured hotkeys on Wine window "
+                    f"0x{wid:x} (pid {pid}).")
 
         self._active_windows = set(current)
+        self._wine_window_order = current_order
+        self._wine_window_geometries = current_geometries
 
         for wid in list(self._grabbed):
             if wid not in current:
@@ -1246,6 +1561,9 @@ class FullscreenKeyInterceptor:
 
     def _release_window(self, display, wid):
         keys = self._grabbed.pop(wid, [])
+        self._grabbed_specs.pop(wid, None)
+        self._grab_retry.pop(wid, None)
+        self._failed_key_grabs.discard(wid)
         if not keys:
             return
         try:
@@ -1356,17 +1674,47 @@ class FullscreenKeyInterceptor:
     # Key handling
     # --------------------------------------------------------
 
-    def _handle_key(self, display, root, event, f11, ret):
+    def _handle_key(self, display, root, event, f11, ret, f12=None, f8=None):
         # CapsLock (LockMask) and NumLock (Mod2Mask) must not change the
         # meaning of the shortcut.
         state = event.state & ~(_X.LockMask | _X.Mod2Mask)
 
-        if event.detail == f11 and state == 0:
+        if f11 and event.detail == f11 and state == 0:
             self._toggle_fullscreen(display, root, event.window)
-        elif event.detail == ret and state == _X.ControlMask:
+        elif ret and event.detail == ret and state == _X.ControlMask:
             # Consume the event: Wine must never receive Ctrl+Enter.
             log("Blocked Ctrl+Enter on a Wine window.")
-
+        elif f12 and event.detail == f12:
+            window_id = int(getattr(event.window, "id", event.window))
+            if (state & _X.ControlMask
+                    and state & ~_X.ControlMask == 0
+                    and self.config.get("clips_enabled", True)):
+                now = time.monotonic()
+                if now - self._last_clip_request < 1.0:
+                    return
+                self._last_clip_request = now
+                with self._clip_lock:
+                    self._clip_request = window_id
+                log(f"Ctrl+F12 clip request received for window "
+                    f"0x{window_id:x}.")
+            elif (state == 0
+                  and self.config.get("screenshots_enabled", True)):
+                now = time.monotonic()
+                if now - self._last_screenshot_request < 0.8:
+                    return
+                self._last_screenshot_request = now
+                with self._screenshot_lock:
+                    self._screenshot_request = window_id
+                log(f"F12 screenshot request received for window "
+                    f"0x{window_id:x}.")
+        elif (f8 and event.detail == f8 and state == 0
+              and self.config.get("launcher_hotkey_enabled", True)):
+            now = time.monotonic()
+            if now - self._last_launcher_request < 1.0:
+                return
+            self._last_launcher_request = now
+            with self._launcher_lock:
+                self._launcher_request = True
     def _toggle_fullscreen(self, display, root, window):
         state_atom = self._atom(display, "_NET_WM_STATE")
         fullscreen_atom = self._atom(display, "_NET_WM_STATE_FULLSCREEN")
@@ -1514,6 +1862,104 @@ def _wait_for_wine_windows(process=None, startup_timeout=120.0,
         time.sleep(0.5)
 
 
+def request_launcher_tab(tab):
+    """Ask the running or next launcher instance to select a media tab."""
+    if tab not in ("screenshots", "clips"):
+        return False
+    temporary = LAUNCHER_TAB_REQUEST_FILE.with_name(
+        f".{LAUNCHER_TAB_REQUEST_FILE.name}.{os.getpid()}.tmp")
+    try:
+        LAUNCHER_TAB_REQUEST_FILE.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(
+            json.dumps({"tab": tab, "created_at": time.time()}),
+            encoding="utf-8")
+        os.replace(temporary, LAUNCHER_TAB_REQUEST_FILE)
+        return True
+    except OSError as error:
+        log(f"Could not request the launcher {tab} tab: {error}")
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+
+
+def take_launcher_tab_request():
+    """Consume a recent media-tab request from the detached shell."""
+    try:
+        request = json.loads(
+            LAUNCHER_TAB_REQUEST_FILE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as error:
+        log(f"Could not read the launcher tab request: {error}")
+        request = None
+    try:
+        LAUNCHER_TAB_REQUEST_FILE.unlink(missing_ok=True)
+    except OSError as error:
+        log(f"Could not clear the launcher tab request: {error}")
+
+    if not isinstance(request, dict):
+        return None
+    tab = request.get("tab")
+    try:
+        age = time.time() - float(request.get("created_at", 0))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if tab not in ("screenshots", "clips") or age < -5 or age > 30:
+        return None
+    return tab
+
+
+def clear_launcher_tab_request():
+    try:
+        LAUNCHER_TAB_REQUEST_FILE.unlink(missing_ok=True)
+    except OSError as error:
+        log(f"Could not clear the launcher tab request: {error}")
+
+
+def _acquire_launcher_lock():
+    """Keep one launcher window; focus it if another instance is open."""
+    import fcntl
+
+    try:
+        LAUNCHER_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(LAUNCHER_LOCK_FILE, "a+", encoding="utf-8")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            handle.seek(0)
+            try:
+                running_pid = int(handle.readline().strip())
+            except ValueError:
+                running_pid = 0
+            handle.close()
+            if running_pid and focus_wine_process(running_pid):
+                message = (
+                    f"{APP_NAME} is already running (PID {running_pid}); "
+                    "focused its existing window.")
+                log(message)
+                print(message, file=sys.stderr, flush=True)
+                return None
+            message = (
+                f"{APP_NAME} is already running (PID {running_pid}), "
+                "but its window could not be focused. Close it before "
+                "starting another instance.")
+            log(message)
+            print(message, file=sys.stderr, flush=True)
+            return None
+
+        handle.seek(0)
+        handle.truncate()
+        handle.write(f"{os.getpid()}\n")
+        handle.flush()
+        return handle
+    except OSError:
+        log("Could not acquire the launcher singleton lock:\n"
+            + traceback.format_exc())
+        return None
+
+
 # ============================================================
 # ENTRY POINT
 # ============================================================
@@ -1526,6 +1972,11 @@ def run(argv=None):
     # entry) launches the program and exits without ever creating a window.
     if len(argv) > 1:
         return launch_from_desktop(argv[1], argv[2:])
+
+    _restart_stale_application_shell()
+    launcher_lock = _acquire_launcher_lock()
+    if launcher_lock is None:
+        return 0
 
     from PyQt6.QtWidgets import QApplication
     from PyQt6.QtGui import QIcon
@@ -1540,27 +1991,6 @@ def run(argv=None):
     app.setWindowIcon(QIcon(str(APP_ICON_FILE)))
     app.setStyle("Fusion")
 
-    # Keep dialogs/prompts centered on the primary monitor instead of
-    # snapping to a corner of the (possibly small) parent window.
-    from PyQt6.QtCore import QEvent, QObject
-
-    class _CenterFilter(QObject):
-        def eventFilter(self, obj, event):
-            if event.type() == QEvent.Type.Show:
-                try:
-                    from PyQt6.QtWidgets import QDialog
-                    if isinstance(obj, QDialog):
-                        screen = app.primaryScreen()
-                        if screen is not None:
-                            geo = screen.availableGeometry()
-                            obj.move(geo.center() - obj.rect().center())
-                except Exception:
-                    pass
-            return False
-
-    _center_filter = _CenterFilter(app)
-    app.installEventFilter(_center_filter)
-
     install_exception_hook()
 
     report = describe_dependencies()
@@ -1571,7 +2001,10 @@ def run(argv=None):
     window.show()
 
     start_application_shell()
-    return app.exec()
+    try:
+        return app.exec()
+    finally:
+        launcher_lock.close()
 
 
 

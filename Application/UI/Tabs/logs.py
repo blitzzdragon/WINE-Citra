@@ -4,19 +4,22 @@ import os
 
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QTimer, QUrl
+from PyQt6.QtCore import QItemSelectionModel, Qt, QTimer, QUrl
 from PyQt6.QtGui import QDesktopServices, QFont
 from PyQt6.QtWidgets import (
-    QCheckBox, QHBoxLayout, QLineEdit, QListWidget, QListWidgetItem, QMessageBox,
-    QPlainTextEdit, QPushButton, QSizePolicy, QSplitter, QVBoxLayout, QWidget,
+    QAbstractItemView, QCheckBox, QHBoxLayout, QLineEdit, QListWidget,
+    QListWidgetItem, QMessageBox, QPlainTextEdit, QPushButton, QSizePolicy,
+    QSplitter, QVBoxLayout, QWidget,
 )
 
 from Core.Runtime.application_runtime import APP_NAME, GLOBAL_LOG, LOG_DIR
+from UI.Audio.sounds import play_sound
 
 
 def open_path(parent, path):
     path = Path(path)
     if not path.exists():
+        play_sound("error")
         QMessageBox.warning(parent, APP_NAME, f"Path does not exist:\n{path}")
         return
     QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
@@ -35,7 +38,9 @@ class LogsTab(QWidget):
         self.log_list = QListWidget()
         self.log_list.setAccessibleName("Application log files")
         self.log_list.setAccessibleDescription(
-            "Select a log to read its recent contents.")
+            "Select one or more logs. The current log's recent contents are shown.")
+        self.log_list.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection)
         self.log_list.currentItemChanged.connect(self.show_log)
         splitter.addWidget(self.log_list)
 
@@ -71,18 +76,22 @@ class LogsTab(QWidget):
         folder = QPushButton("Open Log Folder")
         folder.clicked.connect(lambda: open_path(self, LOG_DIR))
         folder.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        clear = QPushButton("Delete Selected Log")
-        clear.clicked.connect(self.delete_log)
-        clear.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        for button in (refresh, folder, clear):
+        self.delete_button = QPushButton("Delete Selected Logs")
+        self.delete_button.clicked.connect(self.delete_log)
+        self.delete_button.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        for button in (refresh, folder, self.delete_button):
             row.addWidget(button)
         layout.addLayout(row)
 
     def refresh_logs(self):
-        selected_path = None
+        selected_paths = {
+            item.data(Qt.ItemDataRole.UserRole)
+            for item in self.log_list.selectedItems()
+        }
         current = self.log_list.currentItem()
-        if current:
-            selected_path = current.data(Qt.ItemDataRole.UserRole)
+        current_path = (current.data(Qt.ItemDataRole.UserRole)
+                        if current else None)
         self.log_list.blockSignals(True)
         self.log_list.clear()
         paths = sorted(LOG_DIR.glob("*.log"),
@@ -94,19 +103,26 @@ class LogsTab(QWidget):
             self.log_list.addItem(item)
         self.log_list.blockSignals(False)
         self.filter_logs(self.filter_input.text())
-        restored = None
+        restored = []
+        current_item = None
         for index in range(self.log_list.count()):
             item = self.log_list.item(index)
-            if item.data(Qt.ItemDataRole.UserRole) == selected_path:
-                restored = item
-                break
-        if restored is None:
-            restored = next(
+            path = item.data(Qt.ItemDataRole.UserRole)
+            if path in selected_paths:
+                item.setSelected(True)
+                restored.append(item)
+            if path == current_path:
+                current_item = item
+        if current_item is None:
+            current_item = next(
                 (self.log_list.item(i) for i in range(self.log_list.count())
                  if not self.log_list.item(i).isHidden()),
                 None)
-        self.log_list.setCurrentItem(restored)
-        if restored is None:
+            if current_item is not None and not restored:
+                current_item.setSelected(True)
+        self.log_list.setCurrentItem(
+            current_item, QItemSelectionModel.SelectionFlag.NoUpdate)
+        if current_item is None:
             self.log_view.clear()
 
     def filter_logs(self, text):
@@ -133,18 +149,25 @@ class LogsTab(QWidget):
         sb.setValue(sb.maximum())
 
     def delete_log(self):
-        item = self.log_list.currentItem()
-        if not item:
+        items = self.log_list.selectedItems()
+        if not items:
             return
+        names = "\n".join(f"- {item.text()}" for item in items)
         answer = QMessageBox.question(
-            self, "Delete Log",
-            f"Permanently delete '{item.text()}'?",
+            self, "Delete Logs",
+            f"Permanently delete {len(items)} selected log(s)?\n\n{names}",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No)
         if answer != QMessageBox.StandardButton.Yes:
             return
-        try:
-            Path(item.data(Qt.ItemDataRole.UserRole)).unlink()
-        except OSError as e:
-            self.window.message("Failed", str(e), QMessageBox.Icon.Critical)
+        failures = []
+        for item in items:
+            try:
+                Path(item.data(Qt.ItemDataRole.UserRole)).unlink()
+            except OSError as error:
+                failures.append(f"{item.text()}: {error}")
         self.refresh_logs()
+        if failures:
+            self.window.message(
+                "Could Not Delete Logs", "\n".join(failures),
+                QMessageBox.Icon.Critical)

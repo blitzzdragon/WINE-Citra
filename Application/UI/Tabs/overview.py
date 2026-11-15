@@ -15,9 +15,11 @@ from PyQt6.QtWidgets import (
 )
 
 from Core.Runtime.application_runtime import (
-    HOME, application_log, choose_prefix, list_prefixes,
+    HOME, application_log, choose_prefix, focus_wine_process, list_prefixes,
     prefix_exists, save_config, start_wine,
 )
+from UI.Audio.sounds import play_sound
+from UI.Dialouges.crash_popup import show_game_crash_dialog
 
 AUTO_PREFIX = "Automatic (default in Settings)"
 
@@ -27,6 +29,7 @@ class LauncherTab(QWidget):
         super().__init__(window)
         self.window = window
         self.exe_paths = {}
+        self._intentional_stops = set()
         self.build_ui()
         last = (self.window.config.get("last_executable", "")
                 if self.window.config.get("remember_last_executable", True)
@@ -120,8 +123,10 @@ class LauncherTab(QWidget):
         self.running_list = QListWidget()
         self.running_list.setAccessibleName("Running Windows programs")
         self.running_list.setAccessibleDescription(
-            "Select a running program to open its log or stop it.")
-        self.running_list.itemDoubleClicked.connect(self.open_selected_log)
+            "Double-click a running program to bring its window forward. "
+            "Select one to open its log or stop it.")
+        self.running_list.itemDoubleClicked.connect(
+            self.focus_selected_application)
         self.running_list.currentItemChanged.connect(
             self._update_running_actions)
         run_layout.addWidget(self.running_list)
@@ -174,6 +179,18 @@ class LauncherTab(QWidget):
                                 QMessageBox.Icon.Warning)
             return
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(log_path)))
+
+    def focus_selected_application(self, item=None):
+        item = item or self.running_list.currentItem()
+        if item is None:
+            return
+        pid = item.data(Qt.ItemDataRole.UserRole)
+        if focus_wine_process(pid):
+            name = self.window.running.get(pid, (None, item.text()))[1]
+            self.window.set_status(f"Focused {name}.")
+        else:
+            self.window.set_status(
+                "Could not find the running program window to bring forward.")
 
     # Drag and drop an .exe onto the launcher.
     def dragEnterEvent(self, event):
@@ -271,13 +288,21 @@ class LauncherTab(QWidget):
         for pid, (proc, name) in list(self.window.running.items()):
             code = proc.poll()
             if code is not None:
+                exe = self.exe_paths.get(pid)
                 del self.window.running[pid]
                 self.exe_paths.pop(pid, None)
                 changed = True
                 if code != 0:
-                    self.window.set_status(f"{name} exited with code {code} (see Logs)")
+                    if pid not in self._intentional_stops:
+                        play_sound("error", self.window.config)
+                        if exe:
+                            show_game_crash_dialog(
+                                name, code, application_log(exe))
+                    self.window.set_status(
+                        f"{name} exited with code {code} (see Logs)")
                 else:
                     self.window.set_status(f"{name} finished.")
+                self._intentional_stops.discard(pid)
         if changed:
             self.refresh_running()
 
@@ -309,6 +334,7 @@ class LauncherTab(QWidget):
             return
         try:
             os.killpg(os.getpgid(pid), signal.SIGTERM)
+            self._intentional_stops.add(pid)
         except ProcessLookupError:
             self.poll_processes()
         except (PermissionError, OSError) as exc:
